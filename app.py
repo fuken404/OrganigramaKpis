@@ -3,14 +3,21 @@ import streamlit as st
 import pandas as pd
 import time
 
-#Maybe PyVis,Plotly con Tree-plots, Streamlit_Flows (Mejor)
 
-# Estado de sesión
+
+
+#PTE RENDERIZAR CON Streamlit_Flows
+
+
+
+
+#Inicialización de variables de sesión
 if 'df' not in st.session_state:
     st.session_state['df'] = None
 if 'file_id' not in st.session_state:
     st.session_state['file_id'] = None
 
+#Inicialización del GUI
 st.title("Generador de Organigramas")
 st.write("Cargar archivo .xlsx para generar el organigrama")
 fileXlsx = st.file_uploader("Elige un archivo de Excel", type="xlsx")
@@ -62,6 +69,7 @@ def limpiarDatosNecesatrios(dfr):
   
   return df
 
+#Función para validar y asignar jefes faltantes
 def validarJefe(dfr):
   jefe_na = dfr.loc[dfr["Responde al Cargo"].isin(["N/A", "nan", "", "None"]), "Cargo"].drop_duplicates().tolist()
   if not jefe_na:
@@ -160,6 +168,7 @@ def validarNivel(dfr):
         msg.empty()
   return dfr
 
+#Procesar archivo si se ha cargado uno
 if fileXlsx is not None:
   with st.spinner('Actualizando datos...'):
     dfExcel = pd.read_excel(fileXlsx)

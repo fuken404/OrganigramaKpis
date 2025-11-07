@@ -1,7 +1,14 @@
 """Carga de un archivo .xlsx para conversión a .csv y así manipular datos con los que al final con se crea el organigrama"""
-import streamlit as st
+#Librerías para manipulación de datos
 import pandas as pd
 import time
+
+#Librerías para renderizar organigrama
+import streamlit as st
+from streamlit_flow import streamlit_flow
+from streamlit_flow.elements import StreamlitFlowNode, StreamlitFlowEdge 
+from streamlit_flow.state import StreamlitFlowState
+from streamlit_flow.layouts import TreeLayout
 
 
 

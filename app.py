@@ -1,514 +1,1639 @@
-"""Carga de un archivo .xlsx para conversión a .csv y así manipular datos con los que al final con se crea el organigrama"""
-#Librerías para manipulación de datos
+from pathlib import Path
+import os
+import re
+import streamlit as st
+import sqlite3  as sql
 import pandas as pd
 import time
+from contextlib import closing
+import json
 
-#Librerías para renderizar organigrama
-import streamlit as st
-from streamlit_flow import streamlit_flow
-from streamlit_flow.elements import StreamlitFlowNode, StreamlitFlowEdge 
-from streamlit_flow.state import StreamlitFlowState
-from streamlit_flow.layouts import TreeLayout
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain.schema import SystemMessage, HumanMessage
+except Exception:
+    ChatOpenAI = None
+    SystemMessage = HumanMessage = None
 
-# Usar página ancha para aprovechar más espacio horizontal
-st.set_page_config(layout="wide")
+st.title("🗂️ Gestión de Organigrama y KPIs")
 
-#Inicialización de variables de sesión
-if 'df' not in st.session_state:
-    st.session_state['df'] = None
-if 'file_id' not in st.session_state:
-    st.session_state['file_id'] = None
+# Crear DB
+DB_NAME = "organigrama_kpis.db"
 
-#Inicialización del GUI
-st.title("Generador de Organigramas")
-st.write("Cargar archivo .xlsx para generar el organigrama")
-fileXlsx = st.file_uploader("Elige un archivo de Excel", type="xlsx")
-
-#Función para dejar solo los datos necesarios para la creación del organigrama
-def limpiarDatosNecesatrios(dfr):
-  #Paso 1: Crear DataFrame de únicamente cargos sin duplicados
-  df = pd.DataFrame({
-    "Cargo": pd.concat([dfr["Cargo"], dfr["Responde al Cargo"]]).unique()
-    })
-  
-  #Paso 2: Incluir columna de jefes
-  df_jefes = dfr[["Cargo", "Responde al Cargo"]].drop_duplicates(subset="Cargo", keep="first")
-  df = df.merge(
-      df_jefes,
-      on = "Cargo",
-      how = "left"
-  )
-  df["Responde al Cargo"] = df["Responde al Cargo"].fillna("N/A").astype(str)
-
-  #Paso 3: Obtener niveles jerárquicos únicos por cargo y rellenar los faltantes con "N/A"
-  df_nivel = dfr[["Cargo", "Nivel Jerárquico"]].drop_duplicates(subset="Cargo", keep="first")
-  df = df.merge(
-      df_nivel,
-      on="Cargo",
-      how="left"
-  )
-  df["Nivel Jerárquico"] = df["Nivel Jerárquico"].fillna("N/A").astype(str)
-  
-  #Paso 4: Incluir columna para KPI's
-  tmp = dfr[["Cargo", "Indicador"]].copy()
-  tmp["Indicador"] = (
-      tmp["Indicador"]
-        .astype(str)
-        .str.strip()
-  )
-  tmp = tmp[
-      tmp["Indicador"].notna()
-      & (tmp["Indicador"] != "")
-      & (tmp["Indicador"].str.lower() != "n/a")
-  ]
-  df_kpi = (
-      tmp.groupby("Cargo", as_index=False)["Indicador"]
-         .agg(lambda s: list(dict.fromkeys(s)))
-         .rename(columns={"Indicador": "KPIs"})
-  )
-  df = df.merge(df_kpi, on="Cargo", how="left")
-  df["KPIs"] = df["KPIs"].apply(lambda v: v if isinstance(v, list) and len(v) > 0 else ["N/A"])
-  
-  return df
-
-#Función para validar y asignar jefes faltantes
-def validarJefe(dfr):
-  # Cargos sin jefe declarado
-  cargos_sin_jefe = dfr.loc[dfr["Responde al Cargo"].isin(["N/A", "nan", "", "None"]), "Cargo"].drop_duplicates().tolist()
-
-  # Identificar cargos con nivel CEO (etiqueta "CEO" o nivel "1") para no pedir jefe
-  try:
-    ceo_mask = dfr["Nivel Jerárquico"].astype(str).str.strip().str.lower().isin(["1", "CEO"])
-    cargos_ceo = dfr.loc[ceo_mask, "Cargo"].drop_duplicates().tolist()
-  except Exception:
-    cargos_ceo = []
-
-  # Excluir CEO(s) de la lista a solicitar
-  jefe_na = [c for c in cargos_sin_jefe if c not in cargos_ceo]
-
-  if not jefe_na:
-    return dfr
-  else:
-    alerta = st.empty()
-    alerta.warning(f"Hay {len(jefe_na)} cargos sin jefe asignado. Por favor asignar.")
-    form_container = st.empty()
-    with form_container.form(key = "form_asignar_jefes"):
-        st.subheader("Selecciona jefe por cada cargo sin asignar")
-        asignaciones = {}
-        cargos_disponibles = dfr["Cargo"].tolist()
-        for cargo in jefe_na:
-          default_idx = None
-          opciones_jefe = [c for c in cargos_disponibles if c != cargo]
-          sel = st.selectbox(
-              f"Jefe para: {cargo}",
-              options=["-- Seleccionar --"] + opciones_jefe,
-              index=default_idx if default_idx is not None else 0,
-              key=f"sel_jefe_{cargo}"
-          )
-          # Evitar guardar placeholder
-          asignaciones[cargo] = sel if sel != "-- Seleccionar --" else None
-        submit = st.form_submit_button("Guardar Cambios")
-    if submit:
-      dfr["Responde al Cargo"] = dfr.apply(
-          lambda r: asignaciones.get(r["Cargo"])
-                    if (str(r["Responde al Cargo"]) in ["N/A", "nan", "", "None"] and asignaciones.get(r["Cargo"]))
-                    else r["Responde al Cargo"],
-          axis=1
-      )
-      form_container.empty()
-      alerta.empty()
-      msg = st.empty()
-      msg.success("Jefes aplicados.")
-      time.sleep(5)
-      msg.empty()
-  return dfr
-
-# Utilidad para localizar la columna de nivel jerárquico pese a acentos/variantes
-def _find_nivel_col(columns):
-  def norm(s):
-    return ''.join(ch for ch in str(s).lower() if ch.isalpha())
-  for col in columns:
-    n = norm(col)
-    if 'nivel' in n and 'jer' in n:
-      return col
-  return None
-
-# Versión robusta: no pide jefe para CEO (nivel "1" o "CEO")
-def validarJefe_v2(dfr):
-  placeholders = {"N/A", "nan", "", "None"}
-  cargos_sin_jefe = (
-    dfr.loc[dfr["Responde al Cargo"].astype(str).str.strip().isin(placeholders), "Cargo"]
-      .drop_duplicates().tolist()
-  )
-
-  nivel_col = _find_nivel_col(dfr.columns)
-  cargos_ceo = []
-  if nivel_col is not None:
-    s = dfr[nivel_col].astype(str).str.strip().str.lower()
-    ceo_mask = s.eq("1") | s.str.startswith("1") | s.str.contains("ceo")
-    cargos_ceo = dfr.loc[ceo_mask, "Cargo"].drop_duplicates().tolist()
-  # Fallback adicional: detectar por nombre del cargo si no se encontró por nivel
-  if not cargos_ceo:
-    cargos_ceo = dfr.loc[dfr["Cargo"].astype(str).str.strip().str.lower().str.contains("ceo"), "Cargo"].drop_duplicates().tolist()
-
-  jefe_na = [c for c in cargos_sin_jefe if c not in cargos_ceo]
-
-  if not jefe_na:
-    return dfr
-  else:
-    alerta = st.empty()
-    alerta.warning(f"Hay {len(jefe_na)} cargos sin jefe asignado. Por favor asignar.")
-    form_container = st.empty()
-    with form_container.form(key = "form_asignar_jefes"):
-        st.subheader("Selecciona jefe por cada cargo sin asignar")
-        asignaciones = {}
-        cargos_disponibles = dfr["Cargo"].tolist()
-        for cargo in jefe_na:
-          default_idx = None
-          opciones_jefe = [c for c in cargos_disponibles if c != cargo]
-          sel = st.selectbox(
-              f"Jefe para: {cargo}",
-              options=["-- Seleccionar --"] + opciones_jefe,
-              index=default_idx if default_idx is not None else 0,
-              key=f"sel_jefe_{cargo}"
-          )
-          asignaciones[cargo] = sel if sel != "-- Seleccionar --" else None
-        submit = st.form_submit_button("Guardar Cambios")
-    if submit:
-      dfr["Responde al Cargo"] = dfr.apply(
-          lambda r: asignaciones.get(r["Cargo"])
-                    if (str(r["Responde al Cargo"]).strip() in placeholders and asignaciones.get(r["Cargo"]))
-                    else r["Responde al Cargo"],
-          axis=1
-      )
-      form_container.empty()
-      alerta.empty()
-      msg = st.empty()
-      msg.success("Jefes aplicados.")
-      time.sleep(5)
-      msg.empty()
-  return dfr
-
-#Función para validar y asignar niveles jerárquicos faltantes
-def validarNivel(dfr):
-  nivelesJerarquia = {
-    "CEO": 1,
-    "Vicepresidente": 2,
-    "Gerente": 3,
-    "Director": 4,
-    "Jefe / Coordinador": 5,
-    "Profesional / Analista": 6,
-    "Asistente / Auxiliar": 7,
-    "Operativo": 8
-  }
-
-  cargos_na = dfr.loc[dfr["Nivel Jerárquico"].isin(["N/A", "nan", "", "None"]), "Cargo"].drop_duplicates().tolist()
-
-  ya_existe_ceo = (
-    dfr["Nivel Jerárquico"].astype(str).str.strip().str.lower().eq("1").any()
-    or dfr["Nivel Jerárquico"].astype(str).str.strip().str.lower().eq("ceo").any()
-  )
-
-  if not cargos_na:
-      return dfr
-  else:
-    alerta = st.empty()
-    alerta.warning(f"Hay {len(cargos_na)} cargos sin nivel. Por favor asignar.")
-
-    form_container = st.empty()
-    with form_container.form(key = "form_asignar_niveles"):
-        st.subheader("Selecciona nivel por cada cargo sin asignar")
-        asignaciones = {}
-        etiquetas = list(nivelesJerarquia.keys())
-        default_idx = None
-        if ya_existe_ceo:
-          etiquetas = [opt for opt in etiquetas if opt != "CEO"]
-        for cargo in cargos_na:
-            sel = st.selectbox(
-                f"Nivel para: {cargo}",
-                options=["-- Seleccionar --"] + etiquetas,
-                index=default_idx if default_idx is not None else 0,
-                key=f"sel_{cargo}"
-            )
-            # Evitar guardar placeholder; guarda etiqueta válida
-            asignaciones[cargo] = sel if sel != "-- Seleccionar --" else None
-        submit = st.form_submit_button("Guardar Cambios")
-    if submit:
-        dfr["Nivel Jerárquico"] = dfr.apply(
-            lambda r: asignaciones.get(r["Cargo"])
-                      if (str(r["Nivel Jerárquico"]) in ["N/A", "nan", "", "None"] and asignaciones.get(r["Cargo"]))
-                      else r["Nivel Jerárquico"],
-            axis=1
-        )
-        form_container.empty()
-        alerta.empty()
-        msg = st.empty()
-        msg.success("Niveles aplicados.")
-        time.sleep(5)
-        msg.empty()
-  return dfr
-
-#Función para renderizar el organigrama
-def renderizarOrganigrama(df):
-  columnas = {"Cargo", "Responde al Cargo", "KPIs"}
-  if not columnas.issubset(set(df.columns)):
-      st.warning("El DataFrame no contiene las columnas requeridas: 'Cargo', 'Responde al Cargo', 'KPIs'.")
-      return
-  base = df[["Cargo", "Responde al Cargo", "KPIs"]].drop_duplicates(subset="Cargo", keep="first").copy()
-  base["Cargo"] = base["Cargo"].astype(str).str.strip()
-  base["Responde al Cargo"] = base["Responde al Cargo"].astype(str).str.strip()
-  cargos = base["Cargo"].tolist()
-  cargo_set = set(cargos)
-  kpis_map = dict(zip(base["Cargo"], base["KPIs"]))
-  jefe_map = dict(zip(base["Cargo"], base["Responde al Cargo"]))
-  children_by_jefe = {}
-  for cargo in cargos:
-      jefe = jefe_map.get(cargo)
-      if jefe and jefe not in ["N/A", "nan", "None", ""] and jefe in cargo_set and jefe != cargo:
-          children_by_jefe.setdefault(jefe, []).append(cargo)
-  nodes = []
-  edges = []
-  for cargo in cargos:
-      jefe = jefe_map.get(cargo)
-      is_root = (not jefe) or (jefe in ["N/A", "nan", "None", ""]) or (jefe not in cargo_set) or (jefe == cargo)
-      is_leaf = cargo not in children_by_jefe
-      kpis = kpis_map.get(cargo)
-      if not isinstance(kpis, list):
-          kpis = [str(kpis)] if pd.notna(kpis) else ["N/A"]
-      kpis = [str(k).strip() for k in kpis if str(k).strip()]
-      if not kpis:
-          kpis = ["N/A"]
-      content = cargo + "\n" + "\n".join([f"• {k}" for k in kpis])
-      if is_root and is_leaf:
-          node = StreamlitFlowNode(
-              id=cargo,
-              pos=(0, 0),
-              data={"content": content},
-              node_type='input',
-              source_position='bottom',
-              draggable=False,
-          )
-      elif is_root:
-          node = StreamlitFlowNode(
-              id=cargo,
-              pos=(0, 0),
-              data={"content": content},
-              node_type='input',
-              source_position='bottom',
-              draggable=False,
-          )
-      elif is_leaf:
-          node = StreamlitFlowNode(
-              id=cargo,
-              pos=(0, 0),
-              data={"content": content},
-              node_type='output',
-              target_position='top',
-              draggable=False,
-          )
-      else:
-          node = StreamlitFlowNode(
-              id=cargo,
-              pos=(0, 0),
-              data={"content": content},
-              node_type='default',
-              source_position='bottom',
-              target_position='top',
-              draggable=False,
-          )
-      nodes.append(node)
-  for cargo in cargos:
-      jefe = jefe_map.get(cargo)
-      if jefe and jefe not in ["N/A", "nan", "None", ""] and jefe in cargo_set and jefe != cargo:
-          edges.append(StreamlitFlowEdge(f"{jefe}->{cargo}", jefe, cargo, animated=False))
-  if 'flow_state' not in st.session_state:
-      st.session_state['flow_state'] = StreamlitFlowState(nodes, edges)
-  else:
-      st.session_state['flow_state'].nodes = nodes
-      st.session_state['flow_state'].edges = edges
-  streamlit_flow(
-      'org_chart',
-      st.session_state['flow_state'],
-      layout=TreeLayout(direction='down'),
-      fit_view=True,
-  )
-
-def renderizarOrganigramaV2(dfr):
-  columnas = {"Cargo", "Responde al Cargo", "KPIs"}
-  if not columnas.issubset(set(dfr.columns)):
-      st.warning("El DataFrame no contiene las columnas requeridas: 'Cargo', 'Responde al Cargo', 'KPIs'.")
-      return
-
-  base = dfr[["Cargo", "Responde al Cargo", "KPIs"]].drop_duplicates(subset="Cargo", keep="first").copy()
-  base["Cargo"] = base["Cargo"].astype(str).str.strip()
-  base["Responde al Cargo"] = base["Responde al Cargo"].astype(str).str.strip()
-
-  cargos = base["Cargo"].tolist()
-  cargo_set = set(cargos)
-  kpis_map = dict(zip(base["Cargo"], base["KPIs"]))
-  jefe_map = dict(zip(base["Cargo"], base["Responde al Cargo"]))
-
-  # hijos por jefe
-  children_by_jefe = {}
-  for cargo in cargos:
-    jefe = jefe_map.get(cargo)
-    if jefe and jefe not in ["N/A", "nan", "None", ""] and jefe in cargo_set and jefe != cargo:
-      children_by_jefe.setdefault(jefe, []).append(cargo)
-
-  nodes = []
-  edges = []
-
-  def kpi_node_id(c):
-    return f"{c}__KPIs"
-
-  for cargo in cargos:
-    jefe = jefe_map.get(cargo)
-    is_root = (not jefe) or (jefe in ["N/A", "nan", "None", ""]) or (jefe not in cargo_set) or (jefe == cargo)
-    has_children = cargo in children_by_jefe
-
-    # Normalizar KPIs
-    kpis = kpis_map.get(cargo)
-    if not isinstance(kpis, list):
-      kpis = [str(kpis)] if pd.notna(kpis) else ["N/A"]
-    kpis = [str(k).strip() for k in kpis if str(k).strip()]
-    if not kpis:
-      kpis = ["N/A"]
-
-    # Nodo del cargo
-    if is_root:
-      cargo_node = StreamlitFlowNode(
-        id=cargo,
-        pos=(0, 0),
-        data={"content": cargo},
-        node_type='input',
-        source_position='bottom',
-        draggable=False,
-      )
-    else:
-      cargo_node = StreamlitFlowNode(
-        id=cargo,
-        pos=(0, 0),
-        data={"content": cargo},
-        node_type='default',
-        source_position='bottom',
-        target_position='top',
-        draggable=False,
-      )
-    nodes.append(cargo_node)
-
-    # Nodo de KPIs (intermedio)
-    kpi_content = "\n".join([f"- {k}" for k in kpis])
-    if has_children:
-      kpi_node = StreamlitFlowNode(
-        id=kpi_node_id(cargo),
-        pos=(0, 0),
-        data={"content": kpi_content},
-        node_type='default',
-        source_position='bottom',
-        target_position='top',
-        draggable=False,
-      )
-    else:
-      kpi_node = StreamlitFlowNode(
-        id=kpi_node_id(cargo),
-        pos=(0, 0),
-        data={"content": kpi_content},
-        node_type='output',
-        target_position='top',
-        draggable=False,
-      )
-    nodes.append(kpi_node)
-
-    # Conexión cargo -> KPIs
-    edges.append(StreamlitFlowEdge(f"{cargo}=>{kpi_node_id(cargo)}", cargo, kpi_node_id(cargo), animated=False))
-
-  # Conexiones KPIs del jefe -> cargo subordinado
-  for jefe, hijos in children_by_jefe.items():
-    for sub in hijos:
-      edges.append(StreamlitFlowEdge(f"{kpi_node_id(jefe)}=>{sub}", kpi_node_id(jefe), sub, animated=False))
-
-  if 'flow_state' not in st.session_state:
-    st.session_state['flow_state'] = StreamlitFlowState(nodes, edges)
-  else:
-    st.session_state['flow_state'].nodes = nodes
-    st.session_state['flow_state'].edges = edges
-
-  # Render centrado ocupando ~90% del ancho
-  _left, _center, _right = st.columns([0.05, 0.9, 0.05])
-  with _center:
-    streamlit_flow('org_chart', st.session_state['flow_state'], layout=TreeLayout(direction='down'), fit_view=True)
-
-#Procesar archivo si se ha cargado uno
-if fileXlsx is not None:
-  with st.spinner('Actualizando datos...'):
-    dfExcel = pd.read_excel(fileXlsx)
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
+llm = None
+if OPENAI_API_KEY and ChatOpenAI is not None:
     try:
-      # Solo reconstruir df si el archivo cambió o no hay df en sesión
-      if (st.session_state['df'] is None) or (st.session_state['file_id'] != fileXlsx.name):
-        st.session_state['file_id'] = fileXlsx.name
-        st.session_state['df'] = limpiarDatosNecesatrios(dfExcel)
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.15, openai_api_key=OPENAI_API_KEY)
+    except Exception:
+        llm = None
 
-      # Trabajar siempre sobre el df persistente
-      df = st.session_state['df']
+MARIA_SYSTEM_PROMPT = (
+    "Eres MARIA, consultora senior en diseño de KPIs y gestión de desempeño. "
+    "Tu estilo es ejecutivo, conciso y accionable. Cuando generes nuevas ideas de KPI, "
+    "valida que estén alineadas con la estrategia dada, evita duplicar KPIs existentes "
+    "y mantén pesos razonables (la suma no debe exceder 100% si se aplican todos). "
+    "Siempre responde ÚNICAMENTE con un JSON que contenga dos claves: "
+    "'mensaje' (texto breve con tu consejo) y 'kpis' (lista de objetos con "
+    "'nombre', 'peso' y 'indicador_estrategico'). No incluyas texto fuera del JSON."
+)
 
-      # Aplicar validaciones y persistir si hubo cambios
-      updated = validarNivel(df)
-      if updated is not None:
-        st.session_state['df'] = updated
+def normalizar_texto(valor):
+    """Devuelve un string sin espacios o vacío si el valor es nulo/NaN."""
+    if valor is None:
+        return ""
+    try:
+        if pd.isna(valor):
+            return ""
+    except Exception:
+        pass
+    return str(valor).strip()
 
-      updated = validarJefe_v2(st.session_state['df'])
-      if updated is not None:
-        st.session_state['df'] = updated
-        
-      
-      st.dataframe(st.session_state['df'], use_container_width=True)
-      # Render solo cuando no haya cargos sin nivel ni sin jefe (excluye CEO)
-      placeholders = {"N/A", "nan", "", "None"}
-      # detectar nombre real de columna de nivel jerárquico
-      def _find_nivel_col(cols):
-        def norm(s):
-          return ''.join(ch for ch in str(s).lower() if ch.isalpha())
-        for c in cols:
-          n = norm(c)
-          if 'nivel' in n and 'jer' in n:
-            return c
+def buscar_columna_por_nombre(columnas, nombre_objetivo):
+    """Devuelve el nombre real de la columna que coincide (ignorando mayúsculas/espacios)."""
+    objetivo = nombre_objetivo.strip().lower()
+    for col in columnas:
+        if col.strip().lower() == objetivo:
+            return col
+    return None
+
+def reset_database_file():
+    """Elimina la base de datos y archivos auxiliares para reiniciar el flujo."""
+    for suffix in ("", "-wal", "-shm"):
+        path = f"{DB_NAME}{suffix}"
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+def obtener_contexto_cargo_por_nombre(nombre_cargo: str) -> dict:
+    """Extrae datos descriptivos del cargo desde el archivo cargado."""
+    df_fuente = st.session_state.get("df_fuente")
+    if df_fuente is None or not nombre_cargo:
+        return {}
+    columnas = list(df_fuente.columns)
+    col_cargo = buscar_columna_por_nombre(columnas, "Cargo")
+    if not col_cargo:
+        return {}
+    clean_target = normalizar_texto(nombre_cargo).lower()
+    subset = df_fuente[df_fuente[col_cargo].astype(str).str.strip().str.lower() == clean_target]
+    if subset.empty:
+        return {}
+
+    contexto = {}
+    for etiqueta in ["Área", "Departamento", "Responde al Cargo", "Nivel Jerárquico"]:
+        col = buscar_columna_por_nombre(columnas, etiqueta)
+        if col and col in subset:
+            valores = subset[col].dropna().astype(str).str.strip()
+            if not valores.empty:
+                contexto[etiqueta] = valores.iloc[0]
+    return contexto
+
+def _extraer_json_de_respuesta(texto: str):
+    """Intenta extraer un bloque JSON de la respuesta del modelo."""
+    if not texto:
         return None
-      nivel_col = _find_nivel_col(st.session_state['df'].columns)
-      cargos_sin_nivel = []
-      if nivel_col is not None:
-        cargos_sin_nivel = (
-          st.session_state['df']
-            .loc[st.session_state['df'][nivel_col].astype(str).str.strip().isin(placeholders), 'Cargo']
-            .drop_duplicates().tolist()
-        )
-      cargos_sin_jefe = (
-        st.session_state['df']
-          .loc[st.session_state['df']["Responde al Cargo"].astype(str).str.strip().isin(placeholders), 'Cargo']
-          .drop_duplicates().tolist()
-      )
-      ceo_cargos = []
-      if nivel_col is not None:
-        s = st.session_state['df'][nivel_col].astype(str).str.strip().str.lower()
-        ceo_mask = s.eq("1") | s.str.startswith("1") | s.str.contains("ceo")
-        ceo_cargos = st.session_state['df'].loc[ceo_mask, 'Cargo'].drop_duplicates().tolist()
-      if not ceo_cargos:
-        ceo_cargos = (
-          st.session_state['df']
-            .loc[st.session_state['df']["Cargo"].astype(str).str.strip().str.lower().str.contains("ceo"), 'Cargo']
-            .drop_duplicates().tolist()
-        )
-      cargos_sin_jefe = [c for c in cargos_sin_jefe if c not in ceo_cargos]
+    cleaned = texto.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9]*", "", cleaned)
+        cleaned = cleaned.rsplit("```", 1)[0]
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    if match:
+        cleaned = match.group(0)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return None
 
-      if (len(cargos_sin_nivel) == 0) and (len(cargos_sin_jefe) == 0):
-        st.subheader("Organigrama")
-        renderizarOrganigramaV2(st.session_state['df'])
-      else:
-        pendientes = []
-        if len(cargos_sin_nivel) > 0:
-          pendientes.append(f"{len(cargos_sin_nivel)} cargos sin nivel")
-        if len(cargos_sin_jefe) > 0:
-          pendientes.append(f"{len(cargos_sin_jefe)} cargos sin jefe")
-        if pendientes:
-          st.info("Organigrama pendiente: " + ", ".join(pendientes))
-    except Exception as e:
-      st.error("Ha ocurrido un error por favor verifica que el archivo tenga las columnas necesarias: 'Cargo', 'Responde al Cargo', 'Nivel Jerárquico' y 'KPI's'.")
+def generar_kpis_con_maria(nombre_cargo, prompt_usuario, kpis_actuales, indicadores_disponibles, max_kpis=3):
+    """Invoca al agente MARIA para sugerir KPIs."""
+    if llm is None or SystemMessage is None or HumanMessage is None:
+        return ("Configura tu OPENAI_API_KEY en st.secrets para habilitar a MARIA.", None)
+
+    contexto_cargo = obtener_contexto_cargo_por_nombre(nombre_cargo)
+    area = contexto_cargo.get("Área", "Área no especificada")
+    depto = contexto_cargo.get("Departamento", "Departamento no especificado")
+    nivel = contexto_cargo.get("Nivel Jerárquico", "Nivel no especificado")
+    jefe = contexto_cargo.get("Responde al Cargo", "No registrado")
+
+    if kpis_actuales:
+        resumen_kpis = "\n".join(
+            f"- {k['nombre']} (peso {k.get('peso') or 's/d'} / indicador: {k.get('indicador') or 'Sin indicador'})"
+            for k in kpis_actuales
+        )
+    else:
+        resumen_kpis = "- El cargo aún no tiene KPIs guardados."
+
+    indicadores_texto = ", ".join(indicadores_disponibles) if indicadores_disponibles else "Sin indicadores definidos"
+
+    user_payload = (
+        f"Cargo: {nombre_cargo}\n"
+        f"Área: {area}\n"
+        f"Departamento: {depto}\n"
+        f"Nivel: {nivel}\n"
+        f"Responde a: {jefe}\n\n"
+        f"KPIs actuales:\n{resumen_kpis}\n\n"
+        f"Indicadores estratégicos disponibles: {indicadores_texto}\n\n"
+        f"Solicitud del usuario: {prompt_usuario}\n\n"
+        f"Genera hasta {max_kpis} KPI(s) nuevos o refinados alineados al contexto, "
+        "con nombre claro, un peso sugerido y el indicador estratégico al que se conectan. "
+        "Siempre responde en JSON conforme a las instrucciones del sistema."
+    )
+
+    respuesta = llm([SystemMessage(content=MARIA_SYSTEM_PROMPT), HumanMessage(content=user_payload)])
+    contenido = getattr(respuesta, "content", str(respuesta))
+
+    data = _extraer_json_de_respuesta(contenido)
+    mensaje = contenido.strip()
+    tabla = None
+
+    if isinstance(data, dict):
+        mensaje = data.get("mensaje", mensaje)
+        filas = data.get("kpis", [])
+        if isinstance(filas, list) and filas:
+            tabla = pd.DataFrame(filas)
+            if not tabla.empty:
+                tabla = tabla.rename(
+                    columns={
+                        "nombre": "Nombre KPI",
+                        "peso": "Peso sugerido",
+                        "indicador_estrategico": "Indicador estratégico",
+                    }
+                )
+                for columna in ["Nombre KPI", "Peso sugerido", "Indicador estratégico"]:
+                    if columna not in tabla.columns:
+                        tabla[columna] = ""
+                tabla = tabla[["Nombre KPI", "Peso sugerido", "Indicador estratégico"]]
+    return mensaje, tabla
+
+def init_database():
+    """Inicializa la base de datos SOLO si no existe"""
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys = ON")
+        
+        cursor = conn.cursor()
+        
+        # Verificar si las tablas ya existen
+        cursor.execute("""
+        SELECT name FROM sqlite_master 
+        WHERE type='table' AND name='Cargos'
+        """)
+        
+        if cursor.fetchone() is None:
+            # Las tablas NO existen, crearlas
+            st.info("🔧 Creando estructura de base de datos...")
+            
+            cursor.executescript("""
+            DROP TABLE IF EXISTS CargosKpis;
+            DROP TABLE IF EXISTS Kpis;
+            DROP TABLE IF EXISTS IndicadoresEstrategicos;
+            DROP TABLE IF EXISTS Cargos;
+
+            CREATE TABLE IF NOT EXISTS Cargos (
+                id_cargo INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre_cargo TEXT UNIQUE NOT NULL,
+                nivel_cargo TEXT,
+                fk_jefe INTEGER,
+                CONSTRAINT fk_jefe_fk FOREIGN KEY (fk_jefe)
+                    REFERENCES Cargos(id_cargo)
+                    ON UPDATE CASCADE
+                    ON DELETE SET NULL,
+                CONSTRAINT no_self_ref CHECK (fk_jefe IS NULL OR fk_jefe <> id_cargo)
+            );
+
+            CREATE TABLE IF NOT EXISTS IndicadoresEstrategicos (
+                id_kpiEs INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre_kpiEs TEXT UNIQUE NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS Kpis (
+                id_kpi INTEGER PRIMARY KEY AUTOINCREMENT,
+                nombre_kpi TEXT UNIQUE NOT NULL,
+                formula_kpi TEXT,
+                fk_kpiEs INTEGER,
+                CONSTRAINT fk_kpiEs FOREIGN KEY (fk_kpiEs)
+                    REFERENCES IndicadoresEstrategicos(id_kpiEs)
+                    ON UPDATE CASCADE
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS CargosKpis (
+                id_cargoKpi INTEGER PRIMARY KEY AUTOINCREMENT,
+                fk_cargo INTEGER,
+                fk_kpi INTEGER,
+                peso_kpi INTEGER,
+                CONSTRAINT fk_cargo FOREIGN KEY (fk_cargo)
+                    REFERENCES Cargos(id_cargo)
+                    ON UPDATE CASCADE
+                    ON DELETE CASCADE,
+                CONSTRAINT fk_kpi FOREIGN KEY (fk_kpi)
+                    REFERENCES Kpis(id_kpi)
+                    ON UPDATE CASCADE
+                    ON DELETE CASCADE,
+                UNIQUE(fk_cargo, fk_kpi)
+            );
+            """)
+            conn.commit()
+            return True  # Base de datos recién creada
+        else:
+            # Las tablas ya existen
+            return False  # Base de datos ya existía
+
+def insert_data(df):
+    """Inserta los datos desde el DataFrame SOLO si es necesario"""
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        cursor = conn.cursor()
+        
+        # Verificar si ya hay datos
+        cursor.execute("SELECT COUNT(*) FROM Cargos")
+        count = cursor.fetchone()[0]
+        
+        if count > 0:
+            st.info(f"ℹ️ La base de datos ya contiene {count} cargos. Omitiendo inserción de datos.")
+            return
+        
+        st.info("📥 Insertando datos en la base de datos...")
+        
+        # Preparar DataFrames
+        df_cargos = pd.DataFrame({
+            "Cargo": pd.concat([df["Cargo"], df["Responde al Cargo"]]).unique(),
+        })
+        
+        tmp = df[["Cargo", "Nivel Jerárquico"]].drop_duplicates(subset="Cargo", keep="first")
+        df_cargos = df_cargos.merge(tmp, on="Cargo", how="left")
+        df_cargos["Nivel Jerárquico"] = df_cargos["Nivel Jerárquico"].fillna("N/A").astype(str)
+        
+        df_kpis = pd.DataFrame({
+            "Kpis": df["Indicador"],
+            "Fórmula": df["Fórmula"]
+        })
+        
+        df_kpisEs = pd.DataFrame({
+            "IndicadoresEstrategicos": df["Alineado (archivo)"].unique()
+        })
+        
+        # Insertar datos base
+        for _, row in df_cargos.iterrows():
+            cursor.execute("""
+            INSERT OR IGNORE INTO Cargos (nombre_cargo, nivel_cargo)
+            VALUES (?, ?);
+            """, (row["Cargo"], row["Nivel Jerárquico"]))
+        
+        for _, row in df_kpisEs.iterrows():
+            cursor.execute("""
+            INSERT OR IGNORE INTO IndicadoresEstrategicos (nombre_kpiEs)
+            VALUES (?);
+            """, (row["IndicadoresEstrategicos"],))
+        
+        for _, row in df_kpis.iterrows():
+            cursor.execute("""
+            INSERT OR IGNORE INTO Kpis (nombre_kpi, formula_kpi)
+            VALUES (?, ?);
+            """, (row["Kpis"], row["Fórmula"]))
+        
+        conn.commit()
+        
+        #Insertar fks
+        # Actualizar FK
+        for _, row in df.iterrows():
+            if pd.notna(row["Responde al Cargo"]) and row["Cargo"] != row["Responde al Cargo"]:
+                try:
+                    cursor.execute("""
+                    UPDATE Cargos
+                    SET fk_jefe = (SELECT id_cargo FROM Cargos WHERE nombre_cargo = ?)
+                    WHERE nombre_cargo = ?;
+                    """, (row["Responde al Cargo"], row["Cargo"]))
+                except sql.IntegrityError:
+                    pass
+        
+        conn.commit()
+        
+        for _, row in df.iterrows():
+            if pd.notna(row["Alineado (archivo)"]) and pd.notna(row["Indicador"]):
+                cursor.execute("""
+                UPDATE Kpis
+                SET fk_kpiEs = (SELECT id_kpiEs FROM IndicadoresEstrategicos WHERE nombre_kpiEs = ?)
+                WHERE nombre_kpi = ?;
+                """, (row["Alineado (archivo)"], row["Indicador"]))
+        conn.commit()
+        
+        for _, row in df.iterrows():
+            if pd.notna(row["Cargo"]) and pd.notna(row["Indicador"]):
+            # Obtener peso si existe en tu Excel
+                peso = row.get("Peso", None)  # Ajusta el nombre de columna según tu Excel
+
+                cursor.execute("""
+                INSERT OR IGNORE INTO CargosKpis (fk_cargo, fk_kpi, peso_kpi)
+                SELECT 
+                    (SELECT id_cargo FROM Cargos WHERE nombre_cargo = ?),
+                    (SELECT id_kpi FROM Kpis WHERE nombre_kpi = ?),
+                    ?;
+                """, (row["Cargo"], row["Indicador"], peso))
+        conn.commit()
+        st.success("✅ Datos insertados correctamente")
+
+def construir_arbol_organizacional():
+    """Construye el árbol jerárquico de la organización desde la BD"""
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        cursor = conn.cursor()
+        
+        # Obtener todos los cargos con sus jefes
+        cursor.execute("""
+        SELECT id_cargo, nombre_cargo, fk_jefe, nivel_cargo
+        FROM Cargos
+        ORDER BY id_cargo
+        """)
+        cargos = cursor.fetchall()
+    
+    # Crear diccionario de cargos por ID
+    cargo_map = {}
+    for id_cargo, nombre_cargo, fk_jefe, nivel_cargo in cargos:
+        cargo_map[id_cargo] = {
+            "name": nombre_cargo,
+            "id": id_cargo,
+            "fk_jefe": fk_jefe,
+            "nivel": nivel_cargo,
+            "children": []
+        }
+    
+    # Encontrar la raíz (CEO) y construir el árbol
+    root = None
+    orfanos = []  # Cargos sin jefe que no son CEO
+    
+    for id_cargo, node in cargo_map.items():
+        if node["fk_jefe"] is None:
+            # Si no tiene jefe
+            if root is None:
+                root = node  # El primero sin jefe es la raíz
+            else:
+                orfanos.append(node)  # Los demás son huérfanos
+        else:
+            # Agregar como hijo al jefe
+            if node["fk_jefe"] in cargo_map:
+                cargo_map[node["fk_jefe"]]["children"].append(node)
+            else:
+                # Si el jefe no existe, agregar como huérfano
+                orfanos.append(node)
+    
+    # Si hay huérfanos, agregarlos como hijos de la raíz
+    if root and orfanos:
+        root["children"].extend(orfanos)
+    
+    return root if root else {"name": "Organización", "children": list(cargo_map.values())}
+
+def renderizar_organigrama():
+    """Renderiza el organigrama interactivo con streamlit-agraph y permite editar KPIs"""
+    
+    # Inicializar session state para nodo seleccionado
+    if 'nodo_seleccionado' not in st.session_state:
+        st.session_state.nodo_seleccionado = None
+    
+    if 'filtro_cargo' not in st.session_state:
+        st.session_state.filtro_cargo = None
+    
+    # AGREGAR ESTA LÍNEA: Key para forzar reset del selectbox
+    if 'selectbox_key_counter' not in st.session_state:
+        st.session_state.selectbox_key_counter = 0
+    
+    try:
+        from streamlit_agraph import agraph, Node, Edge, Config
+        
+        # Construir árbol completo
+        arbol_completo = construir_arbol_organizacional()
+        
+        # Filtro de búsqueda
+        st.write("## 🔍 Filtrar Organigrama")
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            # Obtener todos los cargos que tienen hijos
+            with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                SELECT DISTINCT c1.id_cargo, c1.nombre_cargo
+                FROM Cargos c1
+                WHERE EXISTS (
+                    SELECT 1 FROM Cargos c2 WHERE c2.fk_jefe = c1.id_cargo
+                )
+                ORDER BY c1.nombre_cargo
+                """)
+                cargos_con_hijos = cursor.fetchall()
+            
+            opciones = ["📊 Ver Todo"] + [f"{nombre}" for _, nombre in cargos_con_hijos]
+            
+            # CAMBIO AQUÍ: Usar index en lugar de depender solo del key
+            index_default = 0  # Siempre empieza en "Ver Todo"
+            if st.session_state.filtro_cargo is not None:
+                # Buscar el índice del cargo filtrado
+                for i, (id_cargo, nombre) in enumerate(cargos_con_hijos, 1):
+                    if id_cargo == st.session_state.filtro_cargo:
+                        index_default = i
+                        break
+            
+            opcion_seleccionada = st.selectbox(
+                "Selecciona un cargo para ver su árbol:",
+                opciones,
+                index=index_default,  # AGREGAR ESTO
+                key=f"filtro_organigrama_{st.session_state.selectbox_key_counter}"  # MODIFICAR ESTO
+            )
+            
+            if opcion_seleccionada == "📊 Ver Todo":
+                st.session_state.filtro_cargo = None
+                arbol = arbol_completo
+            else:
+                # Buscar el ID del cargo seleccionado
+                cargo_id_filtro = next(
+                    (id_cargo for id_cargo, nombre in cargos_con_hijos 
+                     if nombre == opcion_seleccionada),
+                    None
+                )
+                if cargo_id_filtro:
+                    st.session_state.filtro_cargo = cargo_id_filtro
+                    # Buscar ese nodo en el árbol
+                    def buscar_subtarbol(nodo, nodo_id_buscar):
+                        if nodo["id"] == nodo_id_buscar:
+                            return nodo
+                        for hijo in nodo.get("children", []):
+                            resultado = buscar_subtarbol(hijo, nodo_id_buscar)
+                            if resultado:
+                                return resultado
+                        return None
+                    
+                    arbol = buscar_subtarbol(arbol_completo, cargo_id_filtro)
+                    if not arbol:
+                        arbol = arbol_completo
+        
+        with col2:
+            # CAMBIO AQUÍ: Incrementar el counter para forzar recreación del selectbox
+            if st.button("🔄 Limpiar", use_container_width=True):
+                st.session_state.filtro_cargo = None
+                st.session_state.selectbox_key_counter += 1  # AGREGAR ESTO
+                st.rerun()
+        
+        st.divider()
+        
+        # Crear nodos y edges desde el árbol filtrado
+        nodos = []
+        edges = []
+        
+        def agregar_nodos_y_edges(nodo, parent_id=None):
+            """Recursivamente agrega nodos y edges"""
+            nodo_id = str(nodo["id"])
+            nodos.append(Node(id=nodo_id, label=nodo["name"], size=30, title=nodo["name"], shape="box"))
+            
+            if parent_id:
+                edges.append(Edge(source=parent_id, target=nodo_id))
+            
+            for hijo in nodo.get("children", []):
+                agregar_nodos_y_edges(hijo, nodo_id)
+        
+        agregar_nodos_y_edges(arbol)
+        
+        # Configuración del grafo
+        config = Config(
+            width=1400,
+            height=300,
+            directed=True,
+            physics=False,
+            hierarchical=True,
+            layout={"hierarchical": {
+                "direction": "UD", 
+                "sortMethod": "directed",
+                "nodeSpacing": 350,
+                "levelSeparation": 250
+            }},
+            fit=True,
+            suppress_toolbar=False
+        )
+        
+        # Renderizar grafo y capturar click
+        selected_node = agraph(
+            nodes=nodos,
+            edges=edges,
+            config=config
+        )
+        
+        # Si se hace clic en un nodo, guardar en session state
+        if selected_node:
+            try:
+                cargo_id = int(selected_node)
+                
+                with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                    SELECT nombre_cargo FROM Cargos WHERE id_cargo = ?
+                    """, (cargo_id,))
+                    resultado = cursor.fetchone()
+                    
+                    if resultado:
+                        nombre_cargo = resultado[0]
+                        st.session_state.nodo_seleccionado = {
+                            "cargo_id": cargo_id,
+                            "nombre_cargo": nombre_cargo
+                        }
+            except Exception as e:
+                st.error(f"❌ Error al seleccionar nodo: {str(e)}")
+    
+    except ImportError:
+        st.warning("⚠️ Para visualizar el organigrama, instala: pip install streamlit-agraph")
+    
+    # Mostrar panel si hay nodo seleccionado
+    if st.session_state.nodo_seleccionado:
+        cargo_id = st.session_state.nodo_seleccionado["cargo_id"]
+        nombre_cargo = st.session_state.nodo_seleccionado["nombre_cargo"]
+        mostrar_panel_kpis(cargo_id, nombre_cargo)
+
+def mostrar_panel_kpis(cargo_id, nombre_cargo):
+    """Muestra panel editable de KPIs para un cargo en el sidebar"""
+    
+    with st.sidebar:
+        st.markdown(f"### 📊 KPIs de {nombre_cargo}")
+        
+        # Botón cerrar panel
+        if st.button("✕ Cerrar Panel", key=f"close_panel_{cargo_id}"):
+            st.session_state.nodo_seleccionado = None
+            st.rerun()
+        
+        st.divider()
+        
+        with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+            cursor = conn.cursor()
+            
+            # Obtener KPIs asignados al cargo
+            cursor.execute("""
+            SELECT ck.id_cargoKpi,
+                   k.nombre_kpi,
+                   ck.peso_kpi,
+                   k.id_kpi,
+                   ies.nombre_kpiEs,
+                   k.fk_kpiEs
+            FROM CargosKpis ck
+            JOIN Kpis k ON ck.fk_kpi = k.id_kpi
+            LEFT JOIN IndicadoresEstrategicos ies ON k.fk_kpiEs = ies.id_kpiEs
+            WHERE ck.fk_cargo = ?
+            ORDER BY k.nombre_kpi
+            """, (cargo_id,))
+            kpis_cargo = cursor.fetchall()
+            kpis_para_contexto = [
+                {
+                    "id_cargoKpi": id_cargoKpi,
+                    "nombre": nombre_kpi,
+                    "peso": peso_kpi,
+                    "id_kpi": id_kpi,
+                    "indicador": indicador_nombre,
+                    "fk_kpiEs": fk_indicador
+                }
+                for id_cargoKpi, nombre_kpi, peso_kpi, id_kpi, indicador_nombre, fk_indicador in kpis_cargo
+            ]
+            
+            # Obtener indicadores estrategicos disponibles
+            cursor.execute("""
+            SELECT id_kpiEs, nombre_kpiEs
+            FROM IndicadoresEstrategicos
+            ORDER BY nombre_kpiEs
+            """)
+            indicadores_estrategicos = cursor.fetchall()
+        
+        indicadores_opciones = ["-- Sin indicador --"] + [nombre for _, nombre in indicadores_estrategicos]
+        indicadores_dict = {"-- Sin indicador --": None}
+        indicadores_dict.update({nombre: id_kpiEs for id_kpiEs, nombre in indicadores_estrategicos})
+
+        # Crear DataFrame editable con opcion de eliminar
+        if kpis_cargo:
+            datos = []
+            for item in kpis_para_contexto:
+                indicador_display = item["indicador"] if item["indicador"] else "-- Sin indicador --"
+                datos.append({
+                    "KPI": item["nombre"],
+                    "Alineado a": indicador_display,
+                    "Peso (%)": int(item["peso"]) if item["peso"] else 0,
+                    "Eliminar": False,
+                    "id_cargoKpi": item["id_cargoKpi"],
+                    "id_kpi": item["id_kpi"],
+                    "fk_kpiEs": item["fk_kpiEs"]
+                })
+
+            df_kpis = pd.DataFrame(datos)
+
+            st.write("**KPIs Asignados:**")
+            df_editado = st.data_editor(
+                df_kpis[["KPI", "Alineado a", "Peso (%)", "Eliminar"]].copy(),
+                use_container_width=True,
+                key=f"editor_kpis_{cargo_id}",
+                hide_index=True,
+                num_rows="fixed",
+                column_config={
+                    "Alineado a": st.column_config.SelectboxColumn(
+                        "Alineado a",
+                        options=indicadores_opciones,
+                        default="-- Sin indicador --"
+                    )
+                }
+            )
+
+            # Boton para guardar cambios
+            if st.button("Guardar Cambios", key=f"save_kpis_{cargo_id}", use_container_width=True):
+                try:
+                    cambios = 0
+
+                    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        cursor = conn.cursor()
+
+                        # Recorrer cada fila del DataFrame editado
+                        for idx in range(len(df_editado)):
+                            id_cargoKpi = int(df_kpis.loc[idx, "id_cargoKpi"])
+                            nuevo_peso = int(df_editado.loc[idx, "Peso (%)"])
+                            marcar_eliminar = bool(df_editado.loc[idx, "Eliminar"])
+                            peso_original = int(df_kpis.loc[idx, "Peso (%)"])
+                            indicador_original_fk = df_kpis.loc[idx, "fk_kpiEs"]
+                            indicador_seleccionado = df_editado.loc[idx, "Alineado a"]
+                            nuevo_fk = indicadores_dict.get(indicador_seleccionado)
+
+                            if marcar_eliminar:
+                                cursor.execute("""
+                                DELETE FROM CargosKpis
+                                WHERE id_cargoKpi = ?
+                                """, (id_cargoKpi,))
+                                cambios += cursor.rowcount
+                            elif nuevo_peso != peso_original:
+                                cursor.execute("""
+                                UPDATE CargosKpis
+                                SET peso_kpi = ?
+                                WHERE id_cargoKpi = ?
+                                """, (nuevo_peso, id_cargoKpi))
+                                cambios += cursor.rowcount
+
+                            if nuevo_fk != indicador_original_fk:
+                                cursor.execute("""
+                                UPDATE Kpis
+                                SET fk_kpiEs = ?
+                                WHERE id_kpi = ?
+                                """, (nuevo_fk, int(df_kpis.loc[idx, "id_kpi"])))
+                                cambios += cursor.rowcount
+
+                        conn.commit()
+
+                    st.success(f"{cambios} cambio(s) guardado(s)")
+                    time.sleep(1)
+                    st.rerun()
+
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        else:
+            st.info("No hay KPIs asignados")
+
+        st.divider()
+        st.markdown("### 🤖 MARIA · Agente IA de KPIs")
+
+        history_key = f"maria_history_{cargo_id}"
+        if history_key not in st.session_state:
+            st.session_state[history_key] = [
+                {
+                    "role": "assistant",
+                    "content": f"Hola, soy MARIA. Dime qué KPIs necesitas para {nombre_cargo} y te sugeriré opciones alineadas a la estrategia.",
+                }
+            ]
+
+        for msg in st.session_state[history_key]:
+            with st.chat_message("assistant" if msg["role"] == "assistant" else "user"):
+                st.markdown(msg["content"])
+                if msg.get("table"):
+                    st.table(pd.DataFrame(msg["table"]))
+
+        if llm is None:
+            st.info("Configura tu `OPENAI_API_KEY` en `st.secrets` e instala `langchain-openai` para habilitar a MARIA.")
+        else:
+            prompt_key = f"maria_prompt_{cargo_id}"
+            clear_flag_key = f"{prompt_key}_clear"
+            if prompt_key not in st.session_state:
+                st.session_state[prompt_key] = ""
+            if st.session_state.get(clear_flag_key):
+                st.session_state[prompt_key] = ""
+                st.session_state[clear_flag_key] = False
+            user_prompt = st.text_area(
+                "Descríbele a MARIA qué necesitas (contexto adicional, metas, dudas, etc.)",
+                key=prompt_key,
+                height=100,
+            )
+            cantidad_key = f"maria_kpi_count_{cargo_id}"
+            num_kpis = st.slider(
+                "Cantidad de KPIs que deseas que MARIA sugiera",
+                min_value=1,
+                max_value=10,
+                value=3,
+                key=cantidad_key,
+                help="MARIA intentará no superar este número, manteniendo coherencia estratégica."
+            )
+            if st.button("Preguntar a MARIA", key=f"maria_ask_{cargo_id}", use_container_width=True):
+                if not user_prompt.strip():
+                    st.warning("Escribe una solicitud para MARIA.")
+                else:
+                    st.session_state[history_key].append({"role": "user", "content": user_prompt})
+                    mensaje, tabla = generar_kpis_con_maria(
+                        nombre_cargo,
+                        user_prompt,
+                        [
+                            {
+                                "nombre": item["nombre"],
+                                "peso": item["peso"],
+                                "indicador": item["indicador"],
+                            }
+                            for item in kpis_para_contexto
+                        ],
+                        [nombre for _, nombre in indicadores_estrategicos],
+                        max_kpis=num_kpis,
+                    )
+                    registro = {"role": "assistant", "content": mensaje}
+                    if tabla is not None and not tabla.empty:
+                        registro["table"] = tabla.to_dict("records")
+                    st.session_state[history_key].append(registro)
+                    st.session_state[clear_flag_key] = True
+                    st.rerun()
+        nuevo_nombre = st.text_input(
+            "Nombre o Descripcion",
+            placeholder="Ej: Tasa de conversion",
+            key=f"nuevo_kpi_nombre_{cargo_id}"
+        )
+        
+        nuevo_peso = st.number_input(
+            "Peso (%)",
+            min_value=0,
+            max_value=100,
+            value=0,
+            key=f"nuevo_kpi_peso_{cargo_id}"
+        )
+        
+        opciones_indicadores = ["-- Seleccionar --"] + [nombre for _, nombre in indicadores_estrategicos]
+        indicador_seleccionado = st.selectbox(
+            "Alineado a (Indicador Estrategico)",
+            options=opciones_indicadores,
+            key=f"indicador_kpi_{cargo_id}"
+        )
+        
+        if st.button("[+] Crear KPI", key=f"add_kpi_{cargo_id}", use_container_width=True):
+            nombre_limpio = nuevo_nombre.strip()
+            if not nombre_limpio:
+                st.error("Ingresa un nombre para el KPI")
+            elif indicador_seleccionado == "-- Seleccionar --":
+                st.error("Selecciona el indicador estrategico al que se alinea")
+            else:
+                try:
+                    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+                        conn.execute("PRAGMA foreign_keys = ON")
+                        cursor = conn.cursor()
+                        
+                        id_indicador = next(
+                            (id_kpiEs for id_kpiEs, nombre in indicadores_estrategicos if nombre == indicador_seleccionado),
+                            None
+                        )
+                        
+                        if id_indicador is None:
+                            st.error("No se encontro el indicador seleccionado")
+                        else:
+                            try:
+                                cursor.execute("""
+                                INSERT INTO Kpis (nombre_kpi, fk_kpiEs)
+                                VALUES (?, ?)
+                                """, (nombre_limpio, id_indicador))
+                                id_kpi = cursor.lastrowid
+                            except sql.IntegrityError:
+                                cursor.execute("""
+                                SELECT id_kpi FROM Kpis WHERE nombre_kpi = ?
+                                """, (nombre_limpio,))
+                                registro = cursor.fetchone()
+                                if not registro:
+                                    raise
+                                id_kpi = registro[0]
+                            
+                            cursor.execute("""
+                            INSERT INTO CargosKpis (fk_cargo, fk_kpi, peso_kpi)
+                            VALUES (?, ?, ?)
+                            """, (cargo_id, id_kpi, int(nuevo_peso)))
+                            
+                            conn.commit()
+                    
+                    st.success("KPI creado y asignado!")
+                    time.sleep(1)
+                    st.rerun()
+                
+                except Exception as e:
+                    st.error(f"Error al crear KPI: {str(e)}")
+
+def sincronizar_nuevos_kpis(df):
+    """Inserta en la BD los KPIs del archivo que aún no existen."""
+    columnas_fuente = list(df.columns)
+    col_indicador = buscar_columna_por_nombre(columnas_fuente, "Indicador")
+
+    if not col_indicador:
+        st.warning("No se encontró la columna 'Indicador' en el archivo. No se sincronizaron KPIs.")
+        return
+
+    col_formula = buscar_columna_por_nombre(columnas_fuente, "Fórmula")
+    col_alineado_archivo = buscar_columna_por_nombre(columnas_fuente, "Alineado (archivo)")
+
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT nombre_kpi FROM Kpis")
+        existentes = {normalizar_texto(row[0]).lower() for row in cursor.fetchall() if row[0]}
+        nuevos = 0
+
+        for _, row in df.iterrows():
+            indicador = normalizar_texto(row.get(col_indicador, "")) if col_indicador else ""
+            if not indicador or indicador.lower() in existentes:
+                continue
+
+            formula_val = normalizar_texto(row.get(col_formula, "")) if col_formula else ""
+            formula_db = formula_val or None
+
+            fk_kpiEs = None
+            if col_alineado_archivo:
+                alineado = normalizar_texto(row.get(col_alineado_archivo, ""))
+                if alineado:
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO IndicadoresEstrategicos (nombre_kpiEs) VALUES (?)",
+                        (alineado,),
+                    )
+                    cursor.execute(
+                        "SELECT id_kpiEs FROM IndicadoresEstrategicos WHERE nombre_kpiEs = ?",
+                        (alineado,),
+                    )
+                    resultado = cursor.fetchone()
+                    if resultado:
+                        fk_kpiEs = resultado[0]
+
+            cursor.execute(
+                """
+                INSERT INTO Kpis (nombre_kpi, formula_kpi, fk_kpiEs)
+                VALUES (?, ?, ?)
+                """,
+                (indicador, formula_db, fk_kpiEs),
+            )
+            existentes.add(indicador.lower())
+            nuevos += 1
+
+        conn.commit()
+
+    if nuevos:
+        st.success(f"Se sincronizaron {nuevos} KPI(s) nuevos desde el archivo.")
+
+
+def generar_df_hoja3(df_fuente=None):
+    """Genera el DataFrame requerido para la Archivo Actualizado a partir de la base de datos."""
+
+    columnas = [
+        "Indicador",
+        "Fórmula",
+        "Frecuencia",
+        "Fuente",
+        "Responsable",
+        "Meta",
+        "Sentido",
+        "Área",
+        "Departamento",
+        "Cargo",
+        "Responde al Cargo",
+        "Nivel Jerárquico",
+        "Alineado a",
+        "Observaciones",
+        "Alineado (archivo)",
+        "Peso",
+    ]
+
+    extra_campos = [
+        "Frecuencia",
+        "Fuente",
+        "Responsable",
+        "Meta",
+        "Sentido",
+        "Área",
+        "Departamento",
+        "Alineado a",
+        "Observaciones",
+    ]
+
+    extra_map = {}
+    if df_fuente is not None and not df_fuente.empty:
+        columnas_fuente = list(df_fuente.columns)
+        col_indicador = buscar_columna_por_nombre(columnas_fuente, "Indicador")
+        col_cargo = buscar_columna_por_nombre(columnas_fuente, "Cargo")
+        columnas_extra_renombradas = {
+            campo: buscar_columna_por_nombre(columnas_fuente, campo) for campo in extra_campos
+        }
+
+        if col_indicador:
+            for _, row in df_fuente.iterrows():
+                indicador_val = normalizar_texto(row.get(col_indicador, "")) if col_indicador else ""
+                if not indicador_val:
+                    continue
+
+                cargo_val = normalizar_texto(row.get(col_cargo, "")) if col_cargo else ""
+                key = (indicador_val, cargo_val)
+
+                if key not in extra_map:
+                    valores_extra = {}
+                    for campo, col_real in columnas_extra_renombradas.items():
+                        valor = ""
+                        if col_real:
+                            valor = normalizar_texto(row.get(col_real, ""))
+                        valores_extra[campo] = valor
+                    extra_map[key] = valores_extra
+
+                # Guardar versión sin cargo para fallback
+                key_simple = (indicador_val, "")
+                if key_simple not in extra_map:
+                    extra_map[key_simple] = extra_map[key].copy()
+
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                k.nombre_kpi,
+                k.formula_kpi,
+                ck.peso_kpi,
+                c.nombre_cargo,
+                jefe.nombre_cargo,
+                c.nivel_cargo,
+                ies.nombre_kpiEs
+            FROM Kpis k
+            LEFT JOIN CargosKpis ck ON ck.fk_kpi = k.id_kpi
+            LEFT JOIN Cargos c ON ck.fk_cargo = c.id_cargo
+            LEFT JOIN Cargos jefe ON c.fk_jefe = jefe.id_cargo
+            LEFT JOIN IndicadoresEstrategicos ies ON k.fk_kpiEs = ies.id_kpiEs
+            ORDER BY k.nombre_kpi, c.nombre_cargo
+            """
+        )
+        registros = cursor.fetchall()
+
+    data = []
+    for (
+        indicador,
+        formula,
+        peso,
+        cargo,
+        responde,
+        nivel,
+        alineado_archivo,
+    ) in registros:
+        indicador_norm = normalizar_texto(indicador)
+        cargo_norm = normalizar_texto(cargo)
+        extra_valores = extra_map.get((indicador_norm, cargo_norm)) or extra_map.get(
+            (indicador_norm, "")
+        ) or {}
+
+        fila = {
+            "Indicador": indicador_norm,
+            "Fórmula": normalizar_texto(formula),
+            "Frecuencia": extra_valores.get("Frecuencia", ""),
+            "Fuente": extra_valores.get("Fuente", ""),
+            "Responsable": extra_valores.get("Responsable", ""),
+            "Meta": extra_valores.get("Meta", ""),
+            "Sentido": extra_valores.get("Sentido", ""),
+            "Área": extra_valores.get("Área", ""),
+            "Departamento": extra_valores.get("Departamento", ""),
+            "Cargo": cargo_norm,
+            "Responde al Cargo": normalizar_texto(responde),
+            "Nivel Jerárquico": normalizar_texto(nivel),
+            "Alineado a": extra_valores.get("Alineado a", ""),
+            "Observaciones": extra_valores.get("Observaciones", ""),
+            "Alineado (archivo)": normalizar_texto(alineado_archivo),
+            "Peso": peso if peso is not None else "",
+        }
+        data.append(fila)
+
+    if not data:
+        return pd.DataFrame(columns=columnas)
+
+    return pd.DataFrame(data, columns=columnas)
+
+
+def asignar_indicadores_estrategicos_a_ceo():
+    """Asigna los indicadores estratégicos como KPIs al CEO con peso distribuido equitativamente"""
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        cursor = conn.cursor()
+        
+        # Obtener el ID del CEO
+        cursor.execute("""
+        SELECT id_cargo FROM Cargos
+        WHERE UPPER(nombre_cargo) LIKE '%CEO%'
+           OR UPPER(nivel_cargo) = 'PRESIDENCIA'
+        LIMIT 1
+        """)
+        resultado_ceo = cursor.fetchone()
+        
+        if not resultado_ceo:
+            st.error("❌ No se encontró el CEO en la BD")
+            return False
+        
+        id_ceo = resultado_ceo[0]
+        
+        # Obtener todos los indicadores estratégicos
+        cursor.execute("""
+        SELECT id_kpiEs, nombre_kpiEs
+        FROM IndicadoresEstrategicos
+        ORDER BY nombre_kpiEs
+        """)
+        indicadores = cursor.fetchall()
+        
+        if not indicadores:
+            st.info("ℹ️ No hay indicadores estratégicos para asignar")
+            return True
+        
+        # Calcular peso equitativo
+        peso_unitario = 100 // len(indicadores)
+        peso_sobrante = 100 % len(indicadores)
+        
+        # Obtener KPIs asignados al CEO
+        cursor.execute("""
+        SELECT fk_kpi FROM CargosKpis
+        WHERE fk_cargo = ?
+        """, (id_ceo,))
+        kpis_actuales = {row[0] for row in cursor.fetchall()}
+        
+        # Para cada indicador estratégico, crear un KPI que lo represente
+        asignados = 0
+        for idx, (id_kpiEs, nombre_indicador) in enumerate(indicadores):
+            # Buscar si ya existe un KPI con este nombre
+            cursor.execute("""
+            SELECT id_kpi FROM Kpis
+            WHERE nombre_kpi = ?
+            """, (nombre_indicador,))
+            resultado = cursor.fetchone()
+            
+            if resultado:
+                id_kpi = resultado[0]
+            else:
+                # Crear un KPI nuevo con el nombre del indicador estratégico
+                cursor.execute("""
+                INSERT INTO Kpis (nombre_kpi, fk_kpiEs)
+                VALUES (?, ?)
+                """, (nombre_indicador, id_kpiEs))
+                id_kpi = cursor.lastrowid
+            
+            # Calcular peso
+            peso = peso_unitario
+            if idx < peso_sobrante:
+                peso += 1
+            
+            # Insertar en CargosKpis si no existe
+            try:
+                cursor.execute("""
+                INSERT OR IGNORE INTO CargosKpis (fk_cargo, fk_kpi, peso_kpi)
+                VALUES (?, ?, ?)
+                """, (id_ceo, id_kpi, peso))
+                asignados += cursor.rowcount
+            except:
+                pass
+        
+        conn.commit()
+        return asignados > 0
+
+def asignar_niveles_jerarquicos():
+    """Permite al usuario asignar niveles jerárquicos a los cargos usando niveles existentes en la BD"""
+    
+    # Inicializar flag
+    if 'niveles_guardados' not in st.session_state:
+        st.session_state.niveles_guardados = False
+    
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        cursor = conn.cursor()
+        
+        # Identificar y asignar nivel al CEO automáticamente
+        cursor.execute("""
+        SELECT id_cargo, nombre_cargo 
+        FROM Cargos 
+        WHERE UPPER(nombre_cargo) LIKE '%CEO%'
+        LIMIT 1
+        """)
+        ceo = cursor.fetchone()
+        
+        if ceo:
+            cursor.execute("""
+            SELECT nivel_cargo FROM Cargos WHERE id_cargo = ?
+            """, (ceo[0],))
+            nivel_actual = cursor.fetchone()[0]
+            
+            if nivel_actual != 'Presidencia':
+                cursor.execute("""
+                UPDATE Cargos 
+                SET nivel_cargo = 'Presidencia'
+                WHERE id_cargo = ?
+                """, (ceo[0],))
+                conn.commit()
+        
+        # Obtener niveles existentes
+        cursor.execute("""
+        SELECT DISTINCT nivel_cargo 
+        FROM Cargos 
+        WHERE nivel_cargo IS NOT NULL 
+          AND nivel_cargo != 'NULL' 
+          AND nivel_cargo != 'N/A'
+          AND TRIM(nivel_cargo) != ''
+        ORDER BY nivel_cargo
+        """)
+        niveles_existentes = [row[0] for row in cursor.fetchall()]
+        
+        if not niveles_existentes:
+            st.error("❌ No hay niveles jerárquicos definidos en la base de datos.")
+            return False
+        
+        # Obtener cargos sin nivel (EXCLUYENDO al CEO)
+        cursor.execute("""
+        SELECT id_cargo, nombre_cargo, nivel_cargo 
+        FROM Cargos 
+        WHERE (nivel_cargo IS NULL 
+           OR nivel_cargo = 'NULL' 
+           OR nivel_cargo = 'N/A'
+           OR TRIM(nivel_cargo) = '')
+          AND id_cargo != ?
+        ORDER BY nombre_cargo
+        """, (ceo[0] if ceo else -1,))
+        cargos_sin_nivel = cursor.fetchall()
+        
+        if not cargos_sin_nivel:
+            st.success("✅ Todos los cargos tienen un nivel jerárquico asignado")
+            st.session_state.niveles_guardados = True
+            return True
+    
+    st.warning(f"⚠️ Hay {len(cargos_sin_nivel)} cargo(s) sin nivel jerárquico (excluyendo CEO)")
+    
+    # Mostrar niveles disponibles
+    with st.expander("📋 Niveles disponibles en la base de datos"):
+        cols = st.columns(3)
+        for idx, nivel in enumerate(niveles_existentes):
+            with cols[idx % 3]:
+                st.write(f"• {nivel}")
+    
+    st.write("### 🎯 Asigna un nivel jerárquico a cada cargo:")
+    
+    # Preparar opciones
+    niveles_disponibles = ["-- Seleccionar --"] + niveles_existentes
+    
+    # Inicializar session_state para asignaciones
+    if 'asignaciones_niveles' not in st.session_state:
+        st.session_state.asignaciones_niveles = {}
+    
+    # Crear selectbox para CADA cargo
+    for idx, cargo in enumerate(cargos_sin_nivel, 1):
+        id_cargo, nombre_cargo, nivel_actual = cargo
+        
+        st.divider()
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            st.markdown(f"**{idx}. {nombre_cargo}**")
+            nivel_display = nivel_actual if nivel_actual and nivel_actual not in ['NULL', 'N/A', ''] else 'Sin nivel'
+            st.caption(f"Nivel actual: {nivel_display}")
+        
+        with col2:
+            nivel_seleccionado = st.selectbox(
+                "Selecciona el nivel jerárquico:",
+                options=niveles_disponibles,
+                key=f"nivel_{id_cargo}",
+                label_visibility="collapsed"
+            )
+            
+            # Guardar como INTEGER
+            if nivel_seleccionado != "-- Seleccionar --":
+                st.session_state.asignaciones_niveles[int(id_cargo)] = nivel_seleccionado
+            elif int(id_cargo) in st.session_state.asignaciones_niveles:
+                del st.session_state.asignaciones_niveles[int(id_cargo)]
+    
+    st.divider()
+    
+    # Controles
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        if st.button("🔄 Limpiar", use_container_width=True, key="clear_niveles"):
+            st.session_state.asignaciones_niveles = {}
+            st.rerun()
+    
+    with col2:
+        st.metric("Progreso", f"{len(st.session_state.asignaciones_niveles)}/{len(cargos_sin_nivel)}")
+    
+    with col3:
+        if st.button("💾 Guardar Niveles", 
+                     use_container_width=True, 
+                     type="primary",
+                     disabled=(len(st.session_state.asignaciones_niveles) < len(cargos_sin_nivel)),
+                     key="save_niveles"):
+            st.session_state.guardar_niveles_clicked = True
+    
+    # Procesar guardado SI el botón fue clickeado
+    if st.session_state.get('guardar_niveles_clicked', False):
+        
+        if len(st.session_state.asignaciones_niveles) >= len(cargos_sin_nivel):
+            with st.spinner("Guardando niveles..."):
+                try:
+                    # Usar una nueva conexión FUERA del context manager anterior
+                    conn_save = sql.connect(DB_NAME, timeout=30.0)
+                    cursor_save = conn_save.cursor()
+                    
+                    actualizados = 0
+                    for id_cargo, nivel in st.session_state.asignaciones_niveles.items():
+                        cursor_save.execute("""
+                        UPDATE Cargos 
+                        SET nivel_cargo = ?
+                        WHERE id_cargo = ?
+                        """, (nivel, int(id_cargo)))
+                        
+                        actualizados += cursor_save.rowcount
+                    
+                    conn_save.commit()
+                    conn_save.close()
+                    
+                    st.success(f"✅ ¡{actualizados} nivel(es) guardado(s) correctamente!")
+                    
+                    # Esperar antes de limpiar
+                    time.sleep(3)
+                    
+                    # Limpiar flags y asignaciones
+                    st.session_state.asignaciones_niveles = {}
+                    st.session_state.guardar_niveles_clicked = False
+                    st.session_state.niveles_guardados = True
+                    
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Error al guardar: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    st.session_state.guardar_niveles_clicked = False
+                    if 'conn_save' in locals():
+                        conn_save.close()
+        else:
+            st.error("❌ Completa todas las asignaciones antes de guardar")
+            st.session_state.guardar_niveles_clicked = False
+    
+    if len(st.session_state.asignaciones_niveles) < len(cargos_sin_nivel):
+        st.info(f"⏸️ Asigna niveles a todos los cargos para continuar ({len(cargos_sin_nivel) - len(st.session_state.asignaciones_niveles)} pendientes)")
+    
+    return False
+
+def asignar_jefes_faltantes():
+    """Permite al usuario asignar jefes a cargos que no los tienen"""
+    
+    # Inicializar flag
+    if 'jefes_guardados' not in st.session_state:
+        st.session_state.jefes_guardados = False
+    
+    with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+        cursor = conn.cursor()
+        
+        # Identificar al CEO
+        cursor.execute("""
+        SELECT id_cargo, nombre_cargo 
+        FROM Cargos 
+        WHERE UPPER(nombre_cargo) LIKE '%CEO%'
+           OR UPPER(nivel_cargo) = 'PRESIDENCIA'
+        LIMIT 1
+        """)
+        ceo = cursor.fetchone()
+        
+        if ceo:
+            cursor.execute("""
+            UPDATE Cargos 
+            SET fk_jefe = NULL
+            WHERE id_cargo = ?
+            """, (ceo[0],))
+            conn.commit()
+        
+        # Obtener cargos sin jefe (EXCLUYENDO el CEO)
+        cursor.execute("""
+        SELECT id_cargo, nombre_cargo, nivel_cargo 
+        FROM Cargos 
+        WHERE fk_jefe IS NULL 
+          AND (
+            NOT (UPPER(nombre_cargo) LIKE '%CEO%' 
+              OR UPPER(nivel_cargo) = 'PRESIDENCIA')
+          )
+        ORDER BY nombre_cargo
+        """)
+        cargos_sin_jefe = cursor.fetchall()
+        
+        if not cargos_sin_jefe:
+            st.success("✅ Todos los cargos tienen un jefe asignado")
+            st.session_state.jefes_guardados = True
+            return True
+        
+        # Obtener todos los cargos disponibles
+        cursor.execute("""
+        SELECT id_cargo, nombre_cargo, nivel_cargo 
+        FROM Cargos
+        ORDER BY 
+            CASE WHEN nivel_cargo = 'Presidencia' THEN 0 ELSE 1 END,
+            nombre_cargo
+        """)
+        todos_cargos = cursor.fetchall()
+    
+    st.warning(f"⚠️ Hay {len(cargos_sin_jefe)} cargo(s) sin jefe asignado (excluyendo CEO)")
+    st.write("### 📝 Asigna un jefe a cada cargo:")
+    
+    # Inicializar session_state
+    if 'asignaciones_jefes' not in st.session_state:
+        st.session_state.asignaciones_jefes = {}
+    
+    # Crear selectbox para CADA cargo
+    for idx, cargo in enumerate(cargos_sin_jefe, 1):
+        id_cargo, nombre_cargo, nivel_cargo = cargo
+        
+        st.divider()
+        
+        col1, col2 = st.columns([1, 2])
+        
+        with col1:
+            st.markdown(f"**{idx}. {nombre_cargo}**")
+            nivel_display = nivel_cargo if nivel_cargo and nivel_cargo != 'NULL' else 'Sin nivel'
+            st.caption(f"Nivel: {nivel_display}")
+        
+        with col2:
+            opciones = ["-- Seleccionar --"]
+            opciones_map = {}
+            
+            for cargo_disponible in todos_cargos:
+                id_disp, nombre_disp, nivel_disp = cargo_disponible
+                
+                if id_disp != id_cargo:
+                    nivel_text = nivel_disp if nivel_disp and nivel_disp != 'NULL' else 'Sin nivel'
+                    etiqueta = f"{nombre_disp} ({nivel_text})"
+                    opciones.append(etiqueta)
+                    opciones_map[etiqueta] = id_disp
+            
+            seleccion = st.selectbox(
+                "Selecciona el jefe:",
+                options=opciones,
+                key=f"jefe_{id_cargo}",
+                label_visibility="collapsed"
+            )
+            
+            if seleccion != "-- Seleccionar --":
+                st.session_state.asignaciones_jefes[int(id_cargo)] = opciones_map[seleccion]
+            elif int(id_cargo) in st.session_state.asignaciones_jefes:
+                del st.session_state.asignaciones_jefes[int(id_cargo)]
+    
+    st.divider()
+    
+    # Controles
+    col1, col2, col3 = st.columns([1, 1, 1])
+    
+    with col1:
+        if st.button("🔄 Limpiar", use_container_width=True, key="clear_jefes"):
+            st.session_state.asignaciones_jefes = {}
+            st.rerun()
+    
+    with col2:
+        st.metric("Progreso", f"{len(st.session_state.asignaciones_jefes)}/{len(cargos_sin_jefe)}")
+    
+    with col3:
+        if st.button("💾 Guardar Cambios", 
+                     use_container_width=True, 
+                     type="primary",
+                     disabled=(len(st.session_state.asignaciones_jefes) < len(cargos_sin_jefe)),
+                     key="save_jefes"):
+            st.session_state.guardar_jefes_clicked = True
+    
+    # Procesar guardado
+    if st.session_state.get('guardar_jefes_clicked', False):
+        
+        if len(st.session_state.asignaciones_jefes) >= len(cargos_sin_jefe):
+            with st.spinner("Guardando asignaciones..."):
+                try:
+                    conn_save = sql.connect(DB_NAME, timeout=30.0)
+                    conn_save.execute("PRAGMA foreign_keys = ON")
+                    cursor_save = conn_save.cursor()
+                    
+                    actualizados = 0
+                    for id_cargo, id_jefe in st.session_state.asignaciones_jefes.items():
+                        cursor_save.execute("""
+                        UPDATE Cargos 
+                        SET fk_jefe = ?
+                        WHERE id_cargo = ?
+                        """, (id_jefe, int(id_cargo)))
+                        
+                        actualizados += cursor_save.rowcount
+                    
+                    conn_save.commit()
+                    conn_save.close()
+                    
+                    st.success(f"✅ ¡{actualizados} asignación(es) guardada(s) correctamente!")
+                    
+                    time.sleep(3)
+                    
+                    # Limpiar
+                    st.session_state.asignaciones_jefes = {}
+                    st.session_state.guardar_jefes_clicked = False
+                    st.session_state.jefes_guardados = True
+                    
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Error: {str(e)}")
+                    import traceback
+                    st.code(traceback.format_exc())
+                    st.session_state.guardar_jefes_clicked = False
+                    if 'conn_save' in locals():
+                        conn_save.rollback()
+                        conn_save.close()
+        else:
+            st.error("❌ Completa todas las asignaciones")
+            st.session_state.guardar_jefes_clicked = False
+    
+    if len(st.session_state.asignaciones_jefes) < len(cargos_sin_jefe):
+        st.info(f"⏸️ Completa todas las asignaciones para continuar ({len(cargos_sin_jefe) - len(st.session_state.asignaciones_jefes)} pendientes)")
+    
+    return False
+
+
+# Ejecutar (con pestañas)
+# Inicializar base de datos (solo si no existe)
+db_es_nueva = init_database()
+
+# Carga de archivo origen (CSV/XLSX)
+st.write("### Carga de archivo origen")
+uploaded_file = st.file_uploader(
+    "Sube tu archivo base (CSV o XLSX)", type=["csv", "xlsx"], accept_multiple_files=False
+)
+
+if 'df_fuente' not in st.session_state:
+    st.session_state.df_fuente = None
+if 'archivo_procesado' not in st.session_state:
+    st.session_state.archivo_procesado = False
+if 'last_upload_signature' not in st.session_state:
+    st.session_state.last_upload_signature = None
+
+if uploaded_file is not None:
+    signature = f"{uploaded_file.name}-{getattr(uploaded_file, 'size', 0)}"
+    if st.session_state.last_upload_signature != signature:
+        st.session_state.last_upload_signature = signature
+        st.session_state.archivo_procesado = False
+        st.session_state.df_fuente = None
+
+    if not st.session_state.archivo_procesado:
+        try:
+            reset_database_file()
+            init_database()
+            nombre = uploaded_file.name.lower()
+            if nombre.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                try:
+                    df = pd.read_excel(uploaded_file)
+                except Exception as e:
+                    st.error("Error al leer XLSX. Asegurate de tener 'openpyxl' instalado.")
+                    raise
+            st.session_state.df_fuente = df
+            msg_block = st.empty()
+            with msg_block.container():
+                insert_data(df)
+                sincronizar_nuevos_kpis(df)
+                st.success("Archivo cargado y datos insertados (si aplicaba)")
+            time.sleep(3)
+            msg_block.empty()
+            st.session_state.archivo_procesado = True
+        except Exception as e:
+            st.error(f"No se pudo procesar el archivo: {e}")
+else:
+    # Si antes habia archivo cargado y ahora no, reiniciar todo
+    if st.session_state.df_fuente is not None:
+        reset_database_file()
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+    else:
+        st.info("Sube un archivo CSV/XLSX para continuar con el ajuste de datos")
+
+# Pestañas principales
+tab_ajuste, tab_organigrama, tab_hoja3 = st.tabs(["Ajuste de datos", "Organigrama", "Archivo Actualizado"])
+
+with tab_ajuste:
+    if st.session_state.df_fuente is None:
+        st.warning("Sube un archivo en la parte superior para comenzar.")
+    else:
+        # Paso 1
+        st.write("## Paso 1: Asignación de Niveles Jerárquicos")
+        if not st.session_state.get('niveles_guardados', False):
+            asignar_niveles_jerarquicos()
+        else:
+            st.success("Niveles jerárquicos ya asignados")
+
+        st.write("---")
+
+        # Paso 2
+        st.write("## Paso 2: Asignación de Jefes")
+        if st.session_state.get('niveles_guardados', False):
+            if not st.session_state.get('jefes_guardados', False):
+                asignar_jefes_faltantes()
+            else:
+                st.success("Jefes ya asignados")
+        else:
+            st.info("Completa el Paso 1 antes de asignar jefes")
+
+        st.write("---")
+
+        # Paso 3
+        st.write("## Paso 3: Asignación de Indicadores Estratégicos al CEO")
+        if st.session_state.get('niveles_guardados', False) and st.session_state.get('jefes_guardados', False):
+            if not st.session_state.get('indicadores_asignados', False):
+                with st.spinner("Asignando indicadores estratégicos..."):
+                    asignados = asignar_indicadores_estrategicos_a_ceo()
+                    if asignados:
+                        st.success("Indicadores estratégicos asignados al CEO")
+                    else:
+                        st.info("Los indicadores estratégicos ya estaban asignados")
+                    st.session_state.indicadores_asignados = True
+            else:
+                st.success("Indicadores estratégicos ya asignados")
+        else:
+            st.info("Completa los Pasos 1 y 2 antes de asignar indicadores")
+
+with tab_organigrama:
+    if (
+        st.session_state.get('niveles_guardados', False)
+        and st.session_state.get('jefes_guardados', False)
+        and st.session_state.get('indicadores_asignados', False)
+    ):
+        renderizar_organigrama()
+    else:
+        st.warning("Termina el ajuste de datos en la pestaña 'Ajuste de datos' para ver el organigrama")
+
+with tab_hoja3:
+    st.write("## Archivo Actualizado")
+    if st.session_state.df_fuente is None:
+        st.info("Sube un archivo en la parte superior para ver el detalle de KPIs.")
+    else:
+        df_hoja3 = generar_df_hoja3(st.session_state.df_fuente)
+        if df_hoja3.empty:
+            st.warning("No hay KPIs registrados en la base de datos.")
+        st.dataframe(df_hoja3, use_container_width=True, height=400)
+        st.caption("Este resumen se actualiza automáticamente al modificar los KPIs en el organigrama.")
+
+# Detener ejecución del bloque legacy
+st.stop()
+
+# Ejecutar
+# Inicializar base de datos (solo si no existe)
+db_es_nueva = init_database()
+
+# Cargar datos del Excel
+EXCEL_PATH = Path("./data/tst.xlsx")
+df = pd.read_excel(EXCEL_PATH)
+
+# Insertar datos (solo si la BD está vacía)
+insert_data(df)
+
+# PASO 1: Asignar niveles jerárquicos
+if not st.session_state.get('niveles_guardados', False):
+    st.write("## 🎯 Paso 1: Asignación de Niveles Jerárquicos")
+    resultado = asignar_niveles_jerarquicos()
+    if not resultado:  # Si retorna False, detener
+        st.stop()
+
+# PASO 2: Asignar jefes
+if not st.session_state.get('jefes_guardados', False):
+    st.write("---")
+    st.write("## 👥 Paso 2: Asignación de Jefes")
+    resultado = asignar_jefes_faltantes()
+    if not resultado:  # Si retorna False, detener
+        st.stop()
+
+# PASO 3: Asignar indicadores estratégicos al CEO
+if not st.session_state.get('indicadores_asignados', False):
+    st.write("---")
+    st.write("## 📈 Paso 3: Asignación de Indicadores Estratégicos al CEO")
+    
+    with st.spinner("Asignando indicadores estratégicos..."):
+        asignados = asignar_indicadores_estrategicos_a_ceo()
+        if asignados:
+            st.success("✅ Indicadores estratégicos asignados al CEO")
+            st.session_state.indicadores_asignados = True
+            time.sleep(2)
+            st.rerun()
+        else:
+            st.info("ℹ️ Los indicadores estratégicos ya estaban asignados")
+            st.session_state.indicadores_asignados = True
+
+# Mostrar organigrama interactivo
+st.write("---")
+st.write("## 🏢 Organigrama Interactivo")
+st.info("💡 Haz clic en un nodo para ver y editar sus KPIs")
+renderizar_organigrama()
+
+# Botón para reiniciar todo (opcional)
+st.write("---")
+if st.button("🔄 Reiniciar Base de Datos", type="secondary"):
+    import os
+    if os.path.exists(DB_NAME):
+        os.remove(DB_NAME)
+    # Limpiar session_state
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.rerun()

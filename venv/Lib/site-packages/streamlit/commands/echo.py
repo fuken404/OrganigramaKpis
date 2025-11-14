@@ -19,12 +19,12 @@ import contextlib
 import re
 import textwrap
 import traceback
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any
 
 from streamlit.runtime.metrics_util import gather_metrics
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable
+    from collections.abc import Iterable
 
 _SPACES_RE = re.compile("\\s*")
 _EMPTY_LINE_RE = re.compile("\\s*\n")
@@ -32,9 +32,7 @@ _EMPTY_LINE_RE = re.compile("\\s*\n")
 
 @gather_metrics("echo")
 @contextlib.contextmanager
-def echo(
-    code_location: Literal["above", "below"] = "above",
-) -> Generator[None, None, None]:
+def echo(code_location="above"):
     """Use in a `with` block to draw some code on the app, then execute it.
 
     Parameters
@@ -81,7 +79,7 @@ def echo(
             for child in ast.iter_child_nodes(node):
                 # If child doesn't have "lineno", it is not something we could display
                 if hasattr(child, "lineno"):
-                    line_to_node_map[cast("int", child.lineno)] = child
+                    line_to_node_map[child.lineno] = child
                     collect_body_statements(child)
 
         collect_body_statements(root_node)
@@ -101,7 +99,7 @@ def echo(
         show_code(code_string, "python")
 
     except FileNotFoundError as err:
-        show_warning(f"Unable to display code. {err}")
+        show_warning("Unable to display code. %s" % err)
 
 
 def _get_initial_indent(lines: Iterable[str]) -> int:

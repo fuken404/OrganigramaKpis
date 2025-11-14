@@ -66,15 +66,13 @@ class AlertMixin:
               Thumb Up icon. Find additional icons in the `Material Symbols \
               <https://fonts.google.com/icons?icon.set=Material+Symbols&icon.style=Rounded>`_
               font library.
-        width : "stretch" or int
-            The width of the alert element. This can be one of the following:
-
-            - ``"stretch"`` (default): The width of the element matches the
-              width of the parent container.
-            - An integer specifying the width in pixels: The element has a
-              fixed width. If the specified width is greater than the width of
-              the parent container, the width of the element matches the width
-              of the parent container.
+        width : int or "stretch"
+            The desired width of the alert expressed in pixels. If this is
+            ``"stretch"`` (default), Streamlit sets the width of the alert to
+            match the width of the parent container. Otherwise, this must be an
+            integer. If the specified width is greater than the width of the
+            parent container, Streamlit sets the width of the alert to match
+            the width of the parent container.
 
         Example
         -------
@@ -139,15 +137,13 @@ class AlertMixin:
               Thumb Up icon. Find additional icons in the `Material Symbols \
               <https://fonts.google.com/icons?icon.set=Material+Symbols&icon.style=Rounded>`_
               font library.
-        width : "stretch" or int
-            The width of the warning element. This can be one of the following:
-
-            - ``"stretch"`` (default): The width of the element matches the
-              width of the parent container.
-            - An integer specifying the width in pixels: The element has a
-              fixed width. If the specified width is greater than the width of
-              the parent container, the width of the element matches the width
-              of the parent container.
+        width : int or "stretch"
+            The desired width of the alert expressed in pixels. If this is
+            ``"stretch"`` (default), Streamlit sets the width of the alert to
+            match the width of the parent container. Otherwise, this must be an
+            integer. If the specified width is greater than the width of the
+            parent container, Streamlit sets the width of the alert to match
+            the width of the parent container.
 
         Example
         -------
@@ -211,15 +207,13 @@ class AlertMixin:
               Thumb Up icon. Find additional icons in the `Material Symbols \
               <https://fonts.google.com/icons?icon.set=Material+Symbols&icon.style=Rounded>`_
               font library.
-        width : "stretch" or int
-            The width of the info element. This can be one of the following:
-
-            - ``"stretch"`` (default): The width of the element matches the
-              width of the parent container.
-            - An integer specifying the width in pixels: The element has a
-              fixed width. If the specified width is greater than the width of
-              the parent container, the width of the element matches the width
-              of the parent container.
+        width : int or "stretch"
+            The desired width of the alert expressed in pixels. If this is
+            ``"stretch"`` (default), Streamlit sets the width of the alert to
+            match the width of the parent container. Otherwise, this must be an
+            integer. If the specified width is greater than the width of the
+            parent container, Streamlit sets the width of the alert to match
+            the width of the parent container.
 
         Example
         -------
@@ -227,7 +221,7 @@ class AlertMixin:
         >>>
         >>> st.info('This is a purely informational message', icon="ℹ️")
 
-        """  # noqa: RUF002
+        """
 
         alert_proto = AlertProto()
         alert_proto.body = clean_text(body)
@@ -284,15 +278,13 @@ class AlertMixin:
               Thumb Up icon. Find additional icons in the `Material Symbols \
               <https://fonts.google.com/icons?icon.set=Material+Symbols&icon.style=Rounded>`_
               font library.
-        width : "stretch" or int
-            The width of the success element. This can be one of the following:
-
-            - ``"stretch"`` (default): The width of the element matches the
-              width of the parent container.
-            - An integer specifying the width in pixels: The element has a
-              fixed width. If the specified width is greater than the width of
-              the parent container, the width of the element matches the width
-              of the parent container.
+        width : int or "stretch"
+            The desired width of the alert expressed in pixels. If this is
+            ``"stretch"`` (default), Streamlit sets the width of the alert to
+            match the width of the parent container. Otherwise, this must be an
+            integer. If the specified width is greater than the width of the
+            parent container, Streamlit sets the width of the alert to match
+            the width of the parent container.
 
         Example
         -------

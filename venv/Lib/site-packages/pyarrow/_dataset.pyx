@@ -1011,7 +1011,7 @@ cdef class InMemoryDataset(Dataset):
         if isinstance(source, (pa.RecordBatch, pa.Table)):
             source = [source]
 
-        if isinstance(source, (list, tuple, pa.RecordBatchReader)):
+        if isinstance(source, (list, tuple)):
             batches = []
             for item in source:
                 if isinstance(item, pa.RecordBatch):
@@ -1036,8 +1036,8 @@ cdef class InMemoryDataset(Dataset):
                 pyarrow_unwrap_table(table))
         else:
             raise TypeError(
-                'Expected a Table, RecordBatch, list of Table/RecordBatch, '
-                'or RecordBatchReader instead of the given type: ' +
+                'Expected a table, batch, or list of tables/batches '
+                'instead of the given type: ' +
                 type(source).__name__
             )
 
@@ -1128,7 +1128,7 @@ cdef class FileSystemDataset(Dataset):
         elif not isinstance(root_partition, Expression):
             raise TypeError(
                 "Argument 'root_partition' has incorrect type (expected "
-                f"Expression, got {type(root_partition)})"
+                "Expression, got {0})".format(type(root_partition))
             )
 
         for fragment in fragments:
@@ -1220,8 +1220,8 @@ cdef class FileSystemDataset(Dataset):
         ]:
             if not isinstance(arg, class_):
                 raise TypeError(
-                    f"Argument '{name}' has incorrect type (expected {class_.__name__}, "
-                    f"got {type(arg)})"
+                    "Argument '{0}' has incorrect type (expected {1}, "
+                    "got {2})".format(name, class_.__name__, type(arg))
                 )
 
         partitions = partitions or [_true] * len(paths)
@@ -1988,7 +1988,9 @@ cdef class FileFragment(Fragment):
         )
         if partition:
             partition = f" partition=[{partition}]"
-        return f"<pyarrow.dataset.{self.__class__.__name__}{typ} path={self.path}{partition}>"
+        return "<pyarrow.dataset.{0}{1} path={2}{3}>".format(
+            self.__class__.__name__, typ, self.path, partition
+        )
 
     def __reduce__(self):
         buffer = self.buffer
@@ -3383,7 +3385,7 @@ cdef class FileSystemDatasetFactory(DatasetFactory):
                     )
         else:
             raise TypeError('Must pass either paths or a FileSelector, but '
-                            f'passed {type(paths_or_selector)}')
+                            'passed {}'.format(type(paths_or_selector)))
 
         self.init(GetResultValue(result))
 
@@ -3526,7 +3528,7 @@ cdef void _populate_builder(const shared_ptr[CScannerBuilder]& ptr,
                 if not isinstance(expr, Expression):
                     raise TypeError(
                         "Expected an Expression for a 'column' dictionary "
-                        f"value, got {type(expr)} instead"
+                        "value, got {} instead".format(type(expr))
                     )
                 c_exprs.push_back((<Expression> expr).unwrap())
 
@@ -3538,7 +3540,7 @@ cdef void _populate_builder(const shared_ptr[CScannerBuilder]& ptr,
         else:
             raise ValueError(
                 "Expected a list or a dict for 'columns', "
-                f"got {type(columns)} instead."
+                "got {} instead.".format(type(columns))
             )
 
     check_status(builder.BatchSize(batch_size))
@@ -4090,7 +4092,6 @@ def _filesystemdataset_write(
     str basename_template not None,
     FileSystem filesystem not None,
     Partitioning partitioning not None,
-    bool preserve_order,
     FileWriteOptions file_options not None,
     int max_partitions,
     object file_visitor,
@@ -4113,7 +4114,6 @@ def _filesystemdataset_write(
     c_options.filesystem = filesystem.unwrap()
     c_options.base_dir = tobytes(_stringify_path(base_dir))
     c_options.partitioning = partitioning.unwrap()
-    c_options.preserve_order = preserve_order
     c_options.max_partitions = max_partitions
     c_options.max_open_files = max_open_files
     c_options.max_rows_per_file = max_rows_per_file

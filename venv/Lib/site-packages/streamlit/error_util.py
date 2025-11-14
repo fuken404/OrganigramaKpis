@@ -14,36 +14,29 @@
 
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Final
 
 import streamlit
+import streamlit.elements.exception as exception
 from streamlit import config
 from streamlit.delta_generator_singletons import get_dg_singleton_instance
-from streamlit.elements import exception
 from streamlit.logger import get_logger
 
 _LOGGER: Final = get_logger(__name__)
 
 
 def _print_rich_exception(e: BaseException) -> None:
-    from rich.box import Box
-    from rich.panel import Panel
+    from rich import box, panel
 
     # Monkey patch the panel to use our custom box style
-    class ConfigurablePanel(Panel):
+    class ConfigurablePanel(panel.Panel):
         def __init__(
             self,
-            renderable: Any,
-            box: Box | None = None,
-            **kwargs: Any,
-        ) -> None:
-            super().__init__(
-                renderable,
-                box
-                if box is not None
-                else Box("────\n    \n────\n    \n────\n────\n    \n────\n"),
-                **kwargs,
-            )
+            renderable,
+            box=box.Box("────\n    \n────\n    \n────\n────\n    \n────\n"),
+            **kwargs,
+        ):
+            super().__init__(renderable, box, **kwargs)
 
     from rich import traceback as rich_traceback
 

@@ -24,7 +24,7 @@
 #    include <machine/endian.h>  // IWYU pragma: keep
 #  elif defined(sun) || defined(__sun)
 #    include <sys/byteorder.h>  // IWYU pragma: keep
-#  elif !defined(_AIX)
+#  else
 #    include <endian.h>  // IWYU pragma: keep
 #  endif
 #

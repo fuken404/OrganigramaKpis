@@ -82,7 +82,7 @@ class AppStaticFileHandler(tornado.web.StaticFileHandler):
 
         return ret_val
 
-    def set_default_headers(self) -> None:
+    def set_default_headers(self):
         # CORS protection is disabled because we need access to this endpoint
         # from the inner iframe.
         self.set_header("Access-Control-Allow-Origin", "*")

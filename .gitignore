@@ -1,2 +1,21 @@
 #Omitir Entorno Virtual de Python
 venv/
+
+#Omitir la DB y sus temps
+*.db
+*.db-*
+
+#Omitir archivos de configuracion de IDEs
+.vscode/
+
+#Omitir archivos de sistema
+.DS_Store
+
+#Omitir archivos de logs
+*.log
+
+#Omitir archivos de caché de Python
+__pycache__/
+
+#Omitir archivos de configuración de Streamlit
+.streamlit/

@@ -841,7 +841,8 @@ cdef class BufferWriter(NativeFile):
                 offset = offset + position
             else:
                 with gil:
-                    raise ValueError(f"Invalid value of whence: {whence}")
+                    raise ValueError("Invalid value of whence: {0}"
+                                     .format(whence))
             check_status(self.writer.Seek(offset))
         return self.tell()
 

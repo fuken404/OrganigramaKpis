@@ -111,9 +111,9 @@ def _coalesce_widget_states(
     """
     if not old_states and not new_states:
         return None
-    if not old_states:
+    elif not old_states:
         return new_states
-    if not new_states:
+    elif not new_states:
         return old_states
 
     states_by_id: dict[str, WidgetState] = {
@@ -161,7 +161,7 @@ class ScriptRequests:
     ScriptRunner handles those requests.
     """
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._lock = threading.Lock()
         self._state = ScriptRequestType.CONTINUE
         self._rerun_data = RerunData()
@@ -284,10 +284,7 @@ class ScriptRequests:
                 self._state = ScriptRequestType.CONTINUE
                 return ScriptRequest(ScriptRequestType.RERUN, self._rerun_data)
 
-            if self._state != ScriptRequestType.STOP:
-                raise RuntimeError(
-                    f"Unrecognized ScriptRunnerState: {self._state}. This should never happen."
-                )
+            assert self._state == ScriptRequestType.STOP
             return ScriptRequest(ScriptRequestType.STOP)
 
     def on_scriptrunner_ready(self) -> ScriptRequest:

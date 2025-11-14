@@ -49,7 +49,7 @@ def _get_websocket_headers() -> dict[str, str] | None:
         return None
 
     if not isinstance(session_client, BrowserWebSocketHandler):
-        raise TypeError(
+        raise RuntimeError(
             f"SessionClient is not a BrowserWebSocketHandler! ({session_client})"
         )
 

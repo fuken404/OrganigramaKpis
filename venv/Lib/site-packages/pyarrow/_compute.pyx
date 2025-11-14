@@ -40,10 +40,6 @@ except ImportError:
 import warnings
 
 
-# Call to initialize the compute module (register kernels) on import
-check_status(InitializeCompute())
-
-
 __pas = None
 _substrait_msg = (
     "The pyarrow installation is not built with support for Substrait."
@@ -67,10 +63,14 @@ def _pas():
 
 
 def _forbid_instantiation(klass, subclasses_instead=True):
-    msg = f'{klass.__name__} is an abstract class thus cannot be initialized.'
+    msg = '{} is an abstract class thus cannot be initialized.'.format(
+        klass.__name__
+    )
     if subclasses_instead:
         subclasses = [cls.__name__ for cls in klass.__subclasses__]
-        msg += f' Use one of the subclasses instead: {", ".join(subclasses)}'
+        msg += ' Use one of the subclasses instead: {}'.format(
+            ', '.join(subclasses)
+        )
     raise TypeError(msg)
 
 
@@ -201,7 +201,8 @@ cdef class Kernel(_Weakrefable):
     """
 
     def __init__(self):
-        raise TypeError(f"Do not call {self.__class__.__name__}'s constructor directly")
+        raise TypeError("Do not call {}'s constructor directly"
+                        .format(self.__class__.__name__))
 
 
 cdef class ScalarKernel(Kernel):
@@ -211,7 +212,8 @@ cdef class ScalarKernel(Kernel):
         self.kernel = kernel
 
     def __repr__(self):
-        return f"ScalarKernel<{frombytes(self.kernel.signature.get().ToString())}>"
+        return ("ScalarKernel<{}>"
+                .format(frombytes(self.kernel.signature.get().ToString())))
 
 
 cdef class VectorKernel(Kernel):
@@ -221,7 +223,8 @@ cdef class VectorKernel(Kernel):
         self.kernel = kernel
 
     def __repr__(self):
-        return f"VectorKernel<{frombytes(self.kernel.signature.get().ToString())}>"
+        return ("VectorKernel<{}>"
+                .format(frombytes(self.kernel.signature.get().ToString())))
 
 
 cdef class ScalarAggregateKernel(Kernel):
@@ -231,7 +234,8 @@ cdef class ScalarAggregateKernel(Kernel):
         self.kernel = kernel
 
     def __repr__(self):
-        return f"ScalarAggregateKernel<{frombytes(self.kernel.signature.get().ToString())}>"
+        return ("ScalarAggregateKernel<{}>"
+                .format(frombytes(self.kernel.signature.get().ToString())))
 
 
 cdef class HashAggregateKernel(Kernel):
@@ -241,7 +245,8 @@ cdef class HashAggregateKernel(Kernel):
         self.kernel = kernel
 
     def __repr__(self):
-        return f"HashAggregateKernel<{frombytes(self.kernel.signature.get().ToString())}>"
+        return ("HashAggregateKernel<{}>"
+                .format(frombytes(self.kernel.signature.get().ToString())))
 
 
 FunctionDoc = namedtuple(
@@ -293,14 +298,17 @@ cdef class Function(_Weakrefable):
     }
 
     def __init__(self):
-        raise TypeError(f"Do not call {self.__class__.__name__}'s constructor directly")
+        raise TypeError("Do not call {}'s constructor directly"
+                        .format(self.__class__.__name__))
 
     cdef void init(self, const shared_ptr[CFunction]& sp_func) except *:
         self.sp_func = sp_func
         self.base_func = sp_func.get()
 
     def __repr__(self):
-        return f"arrow.compute.Function<name={self.name}, kind={self.kind}, arity={self.arity}, num_kernels={self.num_kernels}>"
+        return ("arrow.compute.Function<name={}, kind={}, "
+                "arity={}, num_kernels={}>"
+                .format(self.name, self.kind, self.arity, self.num_kernels))
 
     def __reduce__(self):
         # Reduction uses the global registry
@@ -1144,36 +1152,6 @@ class PadOptions(_PadOptions):
 
     def __init__(self, width, padding=' ', lean_left_on_odd_padding=True):
         self._set_options(width, padding, lean_left_on_odd_padding)
-
-
-cdef class _ZeroFillOptions(FunctionOptions):
-    def _set_options(self, width, padding):
-        self.wrapped.reset(new CZeroFillOptions(width, tobytes(padding)))
-
-
-class ZeroFillOptions(_ZeroFillOptions):
-    """
-    Options for utf8_zero_fill.
-
-    Parameters
-    ----------
-    width : int
-        Desired string length.
-    padding : str, default "0"
-        Padding character. Should be one Unicode codepoint.
-
-    Examples
-    --------
-    >>> import pyarrow as pa
-    >>> import pyarrow.compute as pc
-    >>> arr = pa.array(["1", "-2", "+3"])
-    >>> opts = pc.ZeroFillOptions(width=4)
-    >>> pc.utf8_zero_fill(arr, options=opts).to_pylist()
-    ['0001', '-002', '+003']
-    """
-
-    def __init__(self, width, padding='0'):
-        self._set_options(width, padding)
 
 
 cdef class _TrimOptions(FunctionOptions):
@@ -2590,7 +2568,9 @@ cdef class Expression(_Weakrefable):
         return frombytes(self.expr.ToString())
 
     def __repr__(self):
-        return f"<pyarrow.compute.{self.__class__.__name__} {self}>"
+        return "<pyarrow.compute.{0} {1}>".format(
+            self.__class__.__name__, str(self)
+        )
 
     @staticmethod
     def from_substrait(object message not None):
@@ -2894,7 +2874,8 @@ cdef class UdfContext:
     """
 
     def __init__(self):
-        raise TypeError(f"Do not call {self.__class__.__name__}'s constructor directly")
+        raise TypeError("Do not call {}'s constructor directly"
+                        .format(self.__class__.__name__))
 
     cdef void init(self, const CUdfContext &c_context):
         self.c_context = c_context
@@ -3029,7 +3010,7 @@ def register_scalar_function(func, function_name, function_doc, in_types, out_ty
         all arguments are scalar, else it must return an Array.
 
         To define a varargs function, pass a callable that takes
-        ``*args``. The last in_type will be the type of all varargs
+        *args. The last in_type will be the type of all varargs
         arguments.
     function_name : str
         Name of the function. There should only be one function

@@ -32,7 +32,7 @@ from streamlit.runtime.state import register_widget
 
 __all__ = [
     "CustomComponent",
-    "MarshallComponentException",
     "declare_component",
+    "MarshallComponentException",
     "register_widget",
 ]

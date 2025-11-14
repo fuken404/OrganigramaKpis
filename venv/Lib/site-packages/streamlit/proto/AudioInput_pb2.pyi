@@ -35,13 +35,11 @@ class AudioInput(google.protobuf.message.Message):
     FORM_ID_FIELD_NUMBER: builtins.int
     DISABLED_FIELD_NUMBER: builtins.int
     LABEL_VISIBILITY_FIELD_NUMBER: builtins.int
-    SAMPLE_RATE_FIELD_NUMBER: builtins.int
     id: builtins.str
     label: builtins.str
     help: builtins.str
     form_id: builtins.str
     disabled: builtins.bool
-    sample_rate: builtins.int
     @property
     def label_visibility(self) -> streamlit.proto.LabelVisibilityMessage_pb2.LabelVisibilityMessage: ...
     def __init__(
@@ -53,10 +51,8 @@ class AudioInput(google.protobuf.message.Message):
         form_id: builtins.str = ...,
         disabled: builtins.bool = ...,
         label_visibility: streamlit.proto.LabelVisibilityMessage_pb2.LabelVisibilityMessage | None = ...,
-        sample_rate: builtins.int | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["_sample_rate", b"_sample_rate", "label_visibility", b"label_visibility", "sample_rate", b"sample_rate"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["_sample_rate", b"_sample_rate", "disabled", b"disabled", "form_id", b"form_id", "help", b"help", "id", b"id", "label", b"label", "label_visibility", b"label_visibility", "sample_rate", b"sample_rate"]) -> None: ...
-    def WhichOneof(self, oneof_group: typing.Literal["_sample_rate", b"_sample_rate"]) -> typing.Literal["sample_rate"] | None: ...
+    def HasField(self, field_name: typing.Literal["label_visibility", b"label_visibility"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["disabled", b"disabled", "form_id", b"form_id", "help", b"help", "id", b"id", "label", b"label", "label_visibility", b"label_visibility"]) -> None: ...
 
 global___AudioInput = AudioInput

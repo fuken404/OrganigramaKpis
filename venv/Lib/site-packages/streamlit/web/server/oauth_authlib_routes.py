@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Final, cast
+from typing import Any
 from urllib.parse import urlparse
 
 import tornado.web
@@ -26,12 +26,9 @@ from streamlit.auth_util import (
     get_secrets_auth_section,
 )
 from streamlit.errors import StreamlitAuthError
-from streamlit.logger import get_logger
 from streamlit.url_util import make_url_path
 from streamlit.web.server.oidc_mixin import TornadoOAuth, TornadoOAuth2App
 from streamlit.web.server.server_util import AUTH_COOKIE_NAME
-
-_LOGGER: Final = get_logger(__name__)
 
 auth_cache = AuthCache()
 
@@ -60,7 +57,7 @@ def create_oauth_client(provider: str) -> tuple[TornadoOAuth2App, str]:
 
     oauth = TornadoOAuth(config, cache=auth_cache)
     oauth.register(provider)
-    return oauth.create_client(provider), redirect_uri  # type: ignore[no-untyped-call]
+    return oauth.create_client(provider), redirect_uri
 
 
 class AuthHandlerMixin(tornado.web.RequestHandler):
@@ -74,13 +71,6 @@ class AuthHandlerMixin(tornado.web.RequestHandler):
 
     def set_auth_cookie(self, user_info: dict[str, Any]) -> None:
         serialized_cookie_value = json.dumps(user_info)
-
-        # log error if cookie value is larger than 4096 bytes
-        if len(serialized_cookie_value.encode()) > 4096:
-            _LOGGER.error(
-                "Authentication cookie size exceeds maximum browser limit of 4096 bytes. Authentication may fail."
-            )
-
         try:
             # We don't specify Tornado secure flag here because it leads to missing cookie on Safari.
             # The OIDC flow should work only on secure context anyway (localhost or HTTPS),
@@ -102,7 +92,7 @@ class AuthHandlerMixin(tornado.web.RequestHandler):
 
 
 class AuthLoginHandler(AuthHandlerMixin, tornado.web.RequestHandler):
-    async def get(self) -> None:
+    async def get(self):
         """Redirect to the OAuth provider login page."""
         provider = self._parse_provider_token()
         if provider is None:
@@ -117,9 +107,9 @@ class AuthLoginHandler(AuthHandlerMixin, tornado.web.RequestHandler):
 
     def _parse_provider_token(self) -> str | None:
         provider_token = self.get_argument("provider", None)
-        if provider_token is None:
-            return None
         try:
+            if provider_token is None:
+                raise StreamlitAuthError("Missing provider token")
             payload = decode_provider_token(provider_token)
         except StreamlitAuthError:
             return None
@@ -128,57 +118,35 @@ class AuthLoginHandler(AuthHandlerMixin, tornado.web.RequestHandler):
 
 
 class AuthLogoutHandler(AuthHandlerMixin, tornado.web.RequestHandler):
-    def get(self) -> None:
+    def get(self):
         self.clear_auth_cookie()
         self.redirect_to_base()
 
 
 class AuthCallbackHandler(AuthHandlerMixin, tornado.web.RequestHandler):
-    async def get(self) -> None:
+    async def get(self):
         provider = self._get_provider_by_state()
         origin = self._get_origin_from_secrets()
         if origin is None:
-            _LOGGER.error(
-                "Error, misconfigured origin for `redirect_uri` in secrets. ",
-            )
             self.redirect_to_base()
             return
 
         error = self.get_argument("error", None)
         if error:
-            error_description = self.get_argument("error_description", None)
-            sanitized_error = error.replace("\n", "").replace("\r", "")
-            sanitized_error_description = (
-                error_description.replace("\n", "").replace("\r", "")
-                if error_description
-                else None
-            )
-            _LOGGER.error(
-                "Error during authentication: %s. Error description: %s",
-                sanitized_error,
-                sanitized_error_description,
-            )
             self.redirect_to_base()
             return
 
         if provider is None:
-            _LOGGER.error(
-                "Error, missing provider for oauth callback.",
-            )
             self.redirect_to_base()
             return
 
         client, _ = create_oauth_client(provider)
         token = client.authorize_access_token(self)
-        user = cast("dict[str, Any]", token.get("userinfo"))
+        user = token.get("userinfo")
 
         cookie_value = dict(user, origin=origin, is_logged_in=True)
         if user:
             self.set_auth_cookie(cookie_value)
-        else:
-            _LOGGER.error(
-                "Error, missing user info.",
-            )
         self.redirect_to_base()
 
     def _get_provider_by_state(self) -> str | None:
@@ -189,7 +157,7 @@ class AuthCallbackHandler(AuthHandlerMixin, tornado.web.RequestHandler):
             _, _, recorded_provider, code = key.split("_")
             state_provider_mapping[code] = recorded_provider
 
-        provider: str | None = state_provider_mapping.get(state_code_from_url)
+        provider: str | None = state_provider_mapping.get(state_code_from_url, None)
         return provider
 
     def _get_origin_from_secrets(self) -> str | None:

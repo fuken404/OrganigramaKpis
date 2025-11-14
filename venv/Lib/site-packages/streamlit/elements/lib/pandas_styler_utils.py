@@ -14,7 +14,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -26,8 +25,6 @@ if TYPE_CHECKING:
     from pandas.io.formats.style import Styler
 
     from streamlit.proto.Arrow_pb2 import Arrow as ArrowProto
-
-from enum import Enum
 
 
 def marshall_styler(proto: ArrowProto, styler: Styler, default_uuid: str) -> None:
@@ -199,24 +196,27 @@ def _pandas_style_to_css(
 
     # In pandas >= 1.1.0
     # translated_style["cellstyle"] has the following shape:
-    # > [
-    # >   {
-    # >       "props": [("color", " black"), ("background-color", "orange"), ("", "")],
-    # >       "selectors": ["row0_col0"]
-    # >   }
-    # >   ...
-    # > ]
-    cell_selectors = (
-        [style["selector"]] if style_type == "table_styles" else style["selectors"]
-    )
+    # [
+    #   {
+    #       "props": [("color", " black"), ("background-color", "orange"), ("", "")],
+    #       "selectors": ["row0_col0"]
+    #   }
+    #   ...
+    # ]
+    if style_type == "table_styles":
+        cell_selectors = [style["selector"]]
+    else:
+        cell_selectors = style["selectors"]
 
-    selectors = [
-        table_selector + separator + cell_selector for cell_selector in cell_selectors
-    ]
+    selectors = []
+    for cell_selector in cell_selectors:
+        selectors.append(table_selector + separator + cell_selector)
     selector = ", ".join(selectors)
 
     declaration_block = "; ".join(declarations)
-    return selector + " { " + declaration_block + " }"
+    rule_set = selector + " { " + declaration_block + " }"
+
+    return rule_set
 
 
 def _marshall_display_values(
@@ -259,36 +259,16 @@ def _use_display_values(df: DataFrame, styles: Mapping[str, Any]) -> DataFrame:
     # If values in a column are not of the same type, Arrow
     # serialization would fail. Thus, we need to cast all values
     # of the dataframe to strings before assigning them display values.
-
     new_df = df.astype(str)
+
     cell_selector_regex = re.compile(r"row(\d+)_col(\d+)")
-    # Outer key = column index; inner key = row index -> target string value
-    updates_by_col: defaultdict[int, dict[int, str]] = defaultdict(dict)
-    for row in styles.get("body", []):
-        for cell in row:
-            cell_id = cell.get("id")
-            if not cell_id:
-                continue
-            match = cell_selector_regex.match(cell_id)
-            if not match:
-                continue
-            row_idx, col_idx = map(int, match.groups())
-            display_value = cell.get("display_value")
-
-            str_value = (
-                str(display_value.value)
-                # Check if the display value is an Enum type. Enum values need to be
-                # converted to their `.value` attribute to ensure proper serialization
-                # and display logic.
-                if isinstance(display_value, Enum)
-                else str(display_value)
-            )
-            updates_by_col[col_idx][row_idx] = str_value
-
-    for col_idx, values_by_row in updates_by_col.items():
-        row_indices = list(values_by_row.keys())
-        values = list(values_by_row.values())
-        # Batch-assign updates for this column using iloc for performance.
-        new_df.iloc[row_indices, col_idx] = values
+    if "body" in styles:
+        rows = styles["body"]
+        for row in rows:
+            for cell in row:
+                if "id" in cell:
+                    if match := cell_selector_regex.match(cell["id"]):
+                        r, c = map(int, match.groups())
+                        new_df.iloc[r, c] = str(cell["display_value"])
 
     return new_df

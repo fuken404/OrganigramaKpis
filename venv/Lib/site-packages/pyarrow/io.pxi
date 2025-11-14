@@ -335,7 +335,8 @@ cdef class NativeFile(_Weakrefable):
                 offset = offset + position
             else:
                 with gil:
-                    raise ValueError(f"Invalid value of whence: {whence}")
+                    raise ValueError("Invalid value of whence: {0}"
+                                     .format(whence))
             check_status(handle.get().Seek(offset))
 
         return self.tell()
@@ -701,7 +702,8 @@ cdef class NativeFile(_Weakrefable):
         # the passed buffer, so it's hard for us to avoid doubling the memory
         buf = <uint8_t*> malloc(buffer_size)
         if buf == NULL:
-            raise MemoryError(f"Failed to allocate {buffer_size} bytes")
+            raise MemoryError("Failed to allocate {0} bytes"
+                              .format(buffer_size))
 
         writer_thread.start()
 
@@ -768,7 +770,8 @@ cdef class NativeFile(_Weakrefable):
         # the passed buffer, so it's hard for us to avoid doubling the memory
         buf = <uint8_t*> malloc(buffer_size)
         if buf == NULL:
-            raise MemoryError(f"Failed to allocate {buffer_size} bytes")
+            raise MemoryError("Failed to allocate {0} bytes"
+                              .format(buffer_size))
 
         cdef int64_t total_bytes = 0
         cdef int32_t c_buffer_size = buffer_size
@@ -948,7 +951,7 @@ cdef class PythonFile(NativeFile):
         elif inferred_mode.startswith('r'):
             kind = 'r'
         else:
-            raise ValueError(f'Invalid file mode: {mode}')
+            raise ValueError('Invalid file mode: {0}'.format(mode))
 
         # If mode was given, check it matches the given file
         if mode is not None:
@@ -1084,7 +1087,7 @@ cdef class MemoryMappedFile(NativeFile):
             self.is_readable = True
             self.is_writable = True
         else:
-            raise ValueError(f'Invalid file mode: {mode}')
+            raise ValueError('Invalid file mode: {0}'.format(mode))
 
         with nogil:
             handle = GetResultValue(CMemoryMappedFile.Open(c_path, c_mode))
@@ -1146,7 +1149,8 @@ def memory_map(path, mode='r'):
 
 cdef _check_is_file(path):
     if os.path.isdir(path):
-        raise IOError(f"Expected file path, but {path} is a directory")
+        raise IOError("Expected file path, but {0} is a directory"
+                      .format(path))
 
 
 def create_memory_map(path, size):
@@ -1243,7 +1247,7 @@ cdef class OSFile(NativeFile):
         elif mode in ('a', 'ab'):
             self._open_writable(c_path, append=True)
         else:
-            raise ValueError(f'Invalid file mode: {mode}')
+            raise ValueError('Invalid file mode: {0}'.format(mode))
 
     cdef _open_readable(self, c_string path, CMemoryPool* pool):
         cdef shared_ptr[ReadableFile] handle
@@ -2208,7 +2212,8 @@ cdef get_writer(object source, shared_ptr[COutputStream]* writer):
         nf = source
         writer[0] = nf.get_output_stream()
     else:
-        raise TypeError(f'Unable to write to object of type: {type(source)}')
+        raise TypeError('Unable to write to object of type: {0}'
+                        .format(type(source)))
 
 
 # ---------------------------------------------------------------------
@@ -2243,7 +2248,7 @@ cdef CCompressionType _ensure_compression(str name) except *:
     elif uppercase == 'ZSTD':
         return CCompressionType_ZSTD
     else:
-        raise ValueError(f'Invalid value for compression: {name!r}')
+        raise ValueError('Invalid value for compression: {!r}'.format(name))
 
 
 cdef class CacheOptions(_Weakrefable):
@@ -2805,8 +2810,8 @@ def input_stream(source, compression='detect', buffer_size=None):
           hasattr(source, 'closed')):
         stream = PythonFile(source, 'r')
     else:
-        raise TypeError(
-            f"pa.input_stream() called with instance of '{source.__class__}'")
+        raise TypeError("pa.input_stream() called with instance of '{}'"
+                        .format(source.__class__))
 
     if compression == 'detect':
         # detect for OSFile too
@@ -2897,8 +2902,8 @@ def output_stream(source, compression='detect', buffer_size=None):
           hasattr(source, 'closed')):
         stream = PythonFile(source, 'w')
     else:
-        raise TypeError(
-            f"pa.output_stream() called with instance of '{source.__class__}'")
+        raise TypeError("pa.output_stream() called with instance of '{}'"
+                        .format(source.__class__))
 
     if compression == 'detect':
         compression = _detect_compression(source_path)

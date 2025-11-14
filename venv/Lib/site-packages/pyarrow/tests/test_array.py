@@ -75,32 +75,17 @@ def test_constructor_raises():
 
 
 def test_list_format():
-    arr = pa.array([["foo"], None, ["bar", "a longer string", None]])
+    arr = pa.array([[1], None, [2, 3, None]])
     result = arr.to_string()
     expected = """\
 [
   [
-    "foo"
+    1
   ],
   null,
   [
-    "bar",
-    "a longer string",
-    null
-  ]
-]"""
-    assert result == expected
-
-    result = arr.to_string(element_size_limit=10)
-    expected = """\
-[
-  [
-    "foo"
-  ],
-  null,
-  [
-    "bar",
-    "a longer (... 7 chars omitted)",
+    2,
+    3,
     null
   ]
 ]"""
@@ -261,7 +246,7 @@ def test_to_numpy_writable():
 @pytest.mark.parametrize('tz', [None, "UTC"])
 def test_to_numpy_datetime64(unit, tz):
     arr = pa.array([1, 2, 3], pa.timestamp(unit, tz=tz))
-    expected = np.array([1, 2, 3], dtype=f"datetime64[{unit}]")
+    expected = np.array([1, 2, 3], dtype="datetime64[{}]".format(unit))
     np_arr = arr.to_numpy()
     np.testing.assert_array_equal(np_arr, expected)
 
@@ -270,7 +255,7 @@ def test_to_numpy_datetime64(unit, tz):
 @pytest.mark.parametrize('unit', ['s', 'ms', 'us', 'ns'])
 def test_to_numpy_timedelta64(unit):
     arr = pa.array([1, 2, 3], pa.duration(unit))
-    expected = np.array([1, 2, 3], dtype=f"timedelta64[{unit}]")
+    expected = np.array([1, 2, 3], dtype="timedelta64[{}]".format(unit))
     np_arr = arr.to_numpy()
     np.testing.assert_array_equal(np_arr, expected)
 
@@ -503,14 +488,15 @@ def test_array_slice():
                 assert res.to_numpy().tolist() == expected
 
 
+@pytest.mark.numpy
 def test_array_slice_negative_step():
     # ARROW-2714
-    values = list(range(20))
-    arr = pa.array(values)
+    np_arr = np.arange(20)
+    arr = pa.array(np_arr)
     chunked_arr = pa.chunked_array([arr])
 
     cases = [
-        slice(None, None, -1),  # GH-46606
+        slice(None, None, -1),
         slice(None, 6, -2),
         slice(10, 6, -2),
         slice(8, None, -2),
@@ -524,7 +510,7 @@ def test_array_slice_negative_step():
 
     for case in cases:
         result = arr[case]
-        expected = pa.array(values[case], type=arr.type)
+        expected = pa.array(np_arr[case])
         assert result.equals(expected)
 
         result = pa.record_batch([arr], names=['f0'])[case]
@@ -532,34 +518,8 @@ def test_array_slice_negative_step():
         assert result.equals(expected)
 
         result = chunked_arr[case]
-        expected = pa.chunked_array([values[case]], type=arr.type)
+        expected = pa.chunked_array([np_arr[case]])
         assert result.equals(expected)
-
-
-def test_arange():
-    cases = [
-        (5, 103),        # Default step
-        (-2, 128, 3),
-        (4, 103, 5),
-        (10, -7, -1),
-        (100, -20, -3),
-        (0, 0),         # Empty array
-        (2, 10, -1),    # Empty array
-        (10, 3, 1),     # Empty array
-    ]
-    for case in cases:
-        result = pa.arange(*case)
-        result.validate(full=True)
-        assert result.equals(pa.array(list(range(*case)), type=pa.int64()))
-
-    # Validate memory_pool keyword argument
-    result = pa.arange(-1, 101, memory_pool=pa.default_memory_pool())
-    result.validate(full=True)
-    assert result.equals(pa.array(list(range(-1, 101)), type=pa.int64()))
-
-    # Special case for invalid step (arange does not accept step of 0)
-    with pytest.raises(pa.ArrowInvalid):
-        pa.arange(0, 10, 0)
 
 
 def test_array_diff():
@@ -568,8 +528,6 @@ def test_array_diff():
     arr2 = pa.array(['foo', 'bar', None], type=pa.utf8())
     arr3 = pa.array([1, 2, 3])
     arr4 = pa.array([[], [1], None], type=pa.list_(pa.int64()))
-    arr5 = pa.array([1.5, 3, 6], type=pa.float16())
-    arr6 = pa.array([1, 3], type=pa.float16())
 
     assert arr1.diff(arr1) == ''
     assert arr1.diff(arr2) == '''
@@ -581,14 +539,6 @@ def test_array_diff():
     assert arr1.diff(arr3).strip() == '# Array types differed: string vs int64'
     assert arr1.diff(arr4).strip() == ('# Array types differed: string vs '
                                        'list<item: int64>')
-    assert arr5.diff(arr5) == ''
-    assert arr5.diff(arr6) == '''
-@@ -0, +0 @@
--1.5
-+1
-@@ -2, +2 @@
--6
-'''
 
 
 def test_array_iter():
@@ -1714,20 +1664,6 @@ def test_floating_point_truncate_unsafe():
         _check_cast_case(case, safe=False)
 
 
-def test_half_float_array_from_python():
-    # GH-46611
-    vals = [-5, 0, 1.0, 2.0, 3, None, 12345.6789, 1.234567, float('inf')]
-    arr = pa.array(vals, type=pa.float16())
-    assert arr.type == pa.float16()
-    assert arr.to_pylist() == [-5, 0, 1.0, 2.0, 3, None, 12344.0,
-                               1.234375, float('inf')]
-    assert str(arr) == ("[\n  -5,\n  0,\n  1,\n  2,\n  3,\n  null,\n  12344,"
-                        "\n  1.234375,\n  inf\n]")
-    msg1 = "Could not convert 'a' with type str: tried to convert to float16"
-    with pytest.raises(pa.ArrowInvalid, match=msg1):
-        arr = pa.array(['a', 3, None], type=pa.float16())
-
-
 def test_decimal_to_int_safe():
     safe_cases = [
         (
@@ -1820,7 +1756,7 @@ def test_decimal_to_int_non_integer():
 
     for case in non_integer_cases:
         # test safe casting raises
-        msg_regexp = 'Rescaling Decimal value would cause data loss'
+        msg_regexp = 'Rescaling Decimal128 value would cause data loss'
         with pytest.raises(pa.ArrowInvalid, match=msg_regexp):
             _check_cast_case(case)
 
@@ -1839,7 +1775,7 @@ def test_decimal_to_decimal():
     )
     assert result.equals(expected)
 
-    msg_regexp = 'Rescaling Decimal value would cause data loss'
+    msg_regexp = 'Rescaling Decimal128 value would cause data loss'
     with pytest.raises(pa.ArrowInvalid, match=msg_regexp):
         result = arr.cast(pa.decimal128(9, 1))
 
@@ -2345,11 +2281,10 @@ def test_array_conversions_no_sentinel_values():
 
     assert arr2.type == 'int8'
 
-    for ty in ['float16', 'float32', 'float64']:
-        arr3 = pa.array(np.array([1, np.nan, 2, 3, np.nan, 4], dtype=ty),
-                        type=ty)
-        assert arr3.type == ty
-        assert arr3.null_count == 0
+    arr3 = pa.array(np.array([1, np.nan, 2, 3, np.nan, 4], dtype='float32'),
+                    type='float32')
+    assert arr3.type == 'float32'
+    assert arr3.null_count == 0
 
 
 def test_time32_time64_from_integer():

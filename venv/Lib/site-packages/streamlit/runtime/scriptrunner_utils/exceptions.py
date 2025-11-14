@@ -34,7 +34,7 @@ class StopException(ScriptControlException):
 class RerunException(ScriptControlException):
     """Silently stop and rerun the user's script."""
 
-    def __init__(self, rerun_data: RerunData) -> None:
+    def __init__(self, rerun_data: RerunData):
         """Construct a RerunException.
 
         Parameters

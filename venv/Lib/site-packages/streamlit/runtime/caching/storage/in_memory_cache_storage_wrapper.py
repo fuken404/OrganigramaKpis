@@ -57,9 +57,7 @@ class InMemoryCacheStorageWrapper(CacheStorage):
     it from multiple threads.
     """
 
-    def __init__(
-        self, persist_storage: CacheStorage, context: CacheStorageContext
-    ) -> None:
+    def __init__(self, persist_storage: CacheStorage, context: CacheStorageContext):
         self.function_key = context.function_key
         self.function_display_name = context.function_display_name
         self._ttl_seconds = context.ttl_seconds
@@ -110,15 +108,18 @@ class InMemoryCacheStorageWrapper(CacheStorage):
 
     def get_stats(self) -> list[CacheStat]:
         """Returns a list of stats in bytes for the cache memory storage per item."""
+        stats = []
+
         with self._mem_cache_lock:
-            return [
-                CacheStat(
-                    category_name="st_cache_data",
-                    cache_name=self.function_display_name,
-                    byte_length=len(item),
+            for item in self._mem_cache.values():
+                stats.append(
+                    CacheStat(
+                        category_name="st_cache_data",
+                        cache_name=self.function_display_name,
+                        byte_length=len(item),
+                    )
                 )
-                for item in self._mem_cache.values()
-            ]
+        return stats
 
     def close(self) -> None:
         """Closes the cache storage."""
@@ -131,8 +132,9 @@ class InMemoryCacheStorageWrapper(CacheStorage):
                 _LOGGER.debug("Memory cache HIT: %s", key)
                 return entry
 
-            _LOGGER.debug("Memory cache MISS: %s", key)
-            raise CacheStorageKeyNotFoundError("Key not found in mem cache")
+            else:
+                _LOGGER.debug("Memory cache MISS: %s", key)
+                raise CacheStorageKeyNotFoundError("Key not found in mem cache")
 
     def _write_to_mem_cache(self, key: str, entry_bytes: bytes) -> None:
         with self._mem_cache_lock:

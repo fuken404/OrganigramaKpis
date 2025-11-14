@@ -68,7 +68,7 @@ class CacheStorageKeyNotFoundError(CacheStorageError):
     """Raised when the key is not found in the cache storage."""
 
 
-class InvalidCacheStorageContextError(CacheStorageError):
+class InvalidCacheStorageContext(CacheStorageError):
     """Raised if the cache storage manager is not able to work with
     provided CacheStorageContext.
     """

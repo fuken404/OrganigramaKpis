@@ -35,7 +35,7 @@ class MemoryUploadedFileManager(UploadedFileManager):
     This class can be used safely from multiple threads simultaneously.
     """
 
-    def __init__(self, upload_endpoint: str) -> None:
+    def __init__(self, upload_endpoint: str):
         self.file_storage: dict[str, dict[str, UploadedFileRec]] = defaultdict(dict)
         self.endpoint = upload_endpoint
 
@@ -92,7 +92,7 @@ class MemoryUploadedFileManager(UploadedFileManager):
 
         self.file_storage[session_id][file.file_id] = file
 
-    def remove_file(self, session_id: str, file_id: str) -> None:
+    def remove_file(self, session_id, file_id):
         """Remove file with given file_id associated with a given session."""
         session_storage = self.file_storage[session_id]
         session_storage.pop(file_id, None)

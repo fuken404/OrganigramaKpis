@@ -105,7 +105,7 @@ def randdecimal(precision, scale):
     fractional = random.randint(0, max_fractional_value)
 
     return decimal.Decimal(
-        f'{whole}.{str(fractional).rjust(scale, "0")}'
+        '{}.{}'.format(whole, str(fractional).rjust(scale, '0'))
     )
 
 
@@ -154,10 +154,9 @@ def memory_leak_check(f, metric='rss', threshold=1 << 17, iterations=10,
     def _leak_check():
         current_use = _get_use()
         if current_use - baseline_use > threshold:
-            raise Exception(
-                "Memory leak detected. Departure from baseline "
-                f"{current_use - baseline_use} after {i} iterations"
-            )
+            raise Exception("Memory leak detected. "
+                            "Departure from baseline {} after {} iterations"
+                            .format(current_use - baseline_use, i))
 
     for i in range(iterations):
         f()
@@ -231,9 +230,9 @@ def disabled_gc():
 def _filesystem_uri(path):
     # URIs on Windows must follow 'file:///C:...' or 'file:/C:...' patterns.
     if os.name == 'nt':
-        uri = f'file:///{path}'
+        uri = 'file:///{}'.format(path)
     else:
-        uri = f'file://{path}'
+        uri = 'file://{}'.format(path)
     return uri
 
 
@@ -397,7 +396,7 @@ def _configure_s3_limited_user(s3_server, policy, username, password):
 
         tempdir = s3_server['tempdir']
         host, port, access_key, secret_key = s3_server['connection']
-        address = f'{host}:{port}'
+        address = '{}:{}'.format(host, port)
 
         mcdir = os.path.join(tempdir, 'mc')
         if os.path.exists(mcdir):

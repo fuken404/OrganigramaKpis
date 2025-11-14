@@ -22,8 +22,6 @@
 #include <utility>
 #include <vector>
 
-#include "arrow/type_fwd.h"
-#include "arrow/util/macros.h"
 #include "parquet/exception.h"
 #include "parquet/level_conversion.h"
 #include "parquet/metadata.h"
@@ -33,6 +31,9 @@
 #include "parquet/types.h"
 
 namespace arrow {
+
+class Array;
+class ChunkedArray;
 
 namespace bit_util {
 class BitReader;
@@ -266,13 +267,10 @@ class PARQUET_EXPORT RecordReader {
   /// @param read_dictionary True if reading directly as Arrow dictionary-encoded
   /// @param read_dense_for_nullable True if reading dense and not leaving space for null
   /// values
-  /// @param arrow_type Which type to read this column as (optional). Currently
-  /// only used for byte array columns (see BinaryRecordReader::GetBuilderChunks).
   static std::shared_ptr<RecordReader> Make(
       const ColumnDescriptor* descr, LevelInfo leaf_info,
       ::arrow::MemoryPool* pool = ::arrow::default_memory_pool(),
-      bool read_dictionary = false, bool read_dense_for_nullable = false,
-      const std::shared_ptr<::arrow::DataType>& arrow_type = NULLPTR);
+      bool read_dictionary = false, bool read_dense_for_nullable = false);
 
   virtual ~RecordReader() = default;
 
@@ -387,8 +385,8 @@ class PARQUET_EXPORT RecordReader {
   /// call. No extra values are buffered for the next call. SkipRecords will not
   /// add any value to this buffer.
   std::shared_ptr<::arrow::ResizableBuffer> values_;
-  /// \brief False for FIXED_LEN_BYTE_ARRAY and BYTE_ARRAY, in which case we
-  /// don't allocate the values buffer and we directly read into builder classes.
+  /// \brief False for BYTE_ARRAY, in which case we don't allocate the values
+  /// buffer and we directly read into builder classes.
   bool uses_values_;
 
   /// \brief Values that we have read into 'values_' + 'null_count_'.

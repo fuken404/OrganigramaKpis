@@ -1,5 +1,4 @@
-from pathlib import Path
-import os
+﻿import os
 import re
 import streamlit as st
 import sqlite3  as sql
@@ -1455,7 +1454,7 @@ def asignar_jefes_faltantes():
 
 # Ejecutar (con pestañas)
 # Inicializar base de datos (solo si no existe)
-db_es_nueva = init_database()
+init_database()
 
 # Carga de archivo origen (CSV/XLSX)
 st.write("### Carga de archivo origen")
@@ -1576,64 +1575,3 @@ with tab_hoja3:
         st.dataframe(df_hoja3, use_container_width=True, height=400)
         st.caption("Este resumen se actualiza automáticamente al modificar los KPIs en el organigrama.")
 
-# Detener ejecución del bloque legacy
-st.stop()
-
-# Ejecutar
-# Inicializar base de datos (solo si no existe)
-db_es_nueva = init_database()
-
-# Cargar datos del Excel
-EXCEL_PATH = Path("./data/tst.xlsx")
-df = pd.read_excel(EXCEL_PATH)
-
-# Insertar datos (solo si la BD está vacía)
-insert_data(df)
-
-# PASO 1: Asignar niveles jerárquicos
-if not st.session_state.get('niveles_guardados', False):
-    st.write("## 🎯 Paso 1: Asignación de Niveles Jerárquicos")
-    resultado = asignar_niveles_jerarquicos()
-    if not resultado:  # Si retorna False, detener
-        st.stop()
-
-# PASO 2: Asignar jefes
-if not st.session_state.get('jefes_guardados', False):
-    st.write("---")
-    st.write("## 👥 Paso 2: Asignación de Jefes")
-    resultado = asignar_jefes_faltantes()
-    if not resultado:  # Si retorna False, detener
-        st.stop()
-
-# PASO 3: Asignar indicadores estratégicos al CEO
-if not st.session_state.get('indicadores_asignados', False):
-    st.write("---")
-    st.write("## 📈 Paso 3: Asignación de Indicadores Estratégicos al CEO")
-    
-    with st.spinner("Asignando indicadores estratégicos..."):
-        asignados = asignar_indicadores_estrategicos_a_ceo()
-        if asignados:
-            st.success("✅ Indicadores estratégicos asignados al CEO")
-            st.session_state.indicadores_asignados = True
-            time.sleep(2)
-            st.rerun()
-        else:
-            st.info("ℹ️ Los indicadores estratégicos ya estaban asignados")
-            st.session_state.indicadores_asignados = True
-
-# Mostrar organigrama interactivo
-st.write("---")
-st.write("## 🏢 Organigrama Interactivo")
-st.info("💡 Haz clic en un nodo para ver y editar sus KPIs")
-renderizar_organigrama()
-
-# Botón para reiniciar todo (opcional)
-st.write("---")
-if st.button("🔄 Reiniciar Base de Datos", type="secondary"):
-    import os
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
-    # Limpiar session_state
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.rerun()

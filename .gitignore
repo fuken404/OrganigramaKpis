@@ -1,5 +1,5 @@
 #Omitir Entorno Virtual de Python
-venv/
+.venv/
 
 #Omitir la DB y sus temps
 *.db

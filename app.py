@@ -6,6 +6,7 @@ import pandas as pd
 import time
 from contextlib import closing
 import json
+from io import BytesIO
 
 try:
     from langchain_openai import ChatOpenAI
@@ -1572,6 +1573,20 @@ with tab_hoja3:
         df_hoja3 = generar_df_hoja3(st.session_state.df_fuente)
         if df_hoja3.empty:
             st.warning("No hay KPIs registrados en la base de datos.")
-        st.dataframe(df_hoja3, use_container_width=True, height=400)
-        st.caption("Este resumen se actualiza automáticamente al modificar los KPIs en el organigrama.")
+        else:
+            st.dataframe(df_hoja3, use_container_width=True, height=400)
+            st.caption("Este resumen se actualiza automáticamente al modificar los KPIs en el organigrama.")
+
+            # Build Excel payload so the download button serves an .xlsx file
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                df_hoja3.to_excel(writer, index=False, sheet_name="KPIs")
+            output.seek(0)
+            st.download_button(
+                "Descargar archivo actualizado (.xlsx)",
+                data=output.getvalue(),
+                file_name="archivo_actualizado.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 

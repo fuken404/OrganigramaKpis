@@ -1,22 +1,65 @@
-from pathlib import Path
+import os
+import re
 import streamlit as st
 import sqlite3  as sql
 import pandas as pd
 import time
 from contextlib import closing
 import json
+from io import BytesIO
+from collections import defaultdict
 
-st.title("🗂️ Gestión de Organigrama y KPIs")
+st.set_page_config(page_title="Calibración de KPIs", layout="wide", page_icon="⚙️")
+
+try:
+    from langchain_openai import ChatOpenAI
+    from langchain.schema import SystemMessage, HumanMessage
+except Exception:
+    ChatOpenAI = None
+    SystemMessage = HumanMessage = None
+
+st.title("⚙️ Calibración de KPIs")
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-left: 1.5rem !important;
+        padding-right: 1.5rem !important;
+        max-width: 100% !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Crear DB
 DB_NAME = "organigrama_kpis.db"
+
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
+llm = None
+if OPENAI_API_KEY and ChatOpenAI is not None:
+    try:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.15, openai_api_key=OPENAI_API_KEY)
+    except Exception:
+        llm = None
+
+MARIA_SYSTEM_PROMPT = (
+    "Eres MARIA, consultora senior en diseño de KPIs y gestión de desempeño. "
+    "Tu estilo es ejecutivo, conciso y accionable. Cuando generes nuevas ideas de KPI, "
+    "valida que estén alineadas con la estrategia dada, evita duplicar KPIs existentes "
+    "y mantén pesos razonables (la suma no debe exceder 100% si se aplican todos). "
+    "Siempre responde ÚNICAMENTE con un JSON que contenga dos claves: "
+    "'mensaje' (texto breve con tu consejo) y 'kpis' (lista de objetos con "
+    "'nombre', 'peso', 'indicador_estrategico' y 'formula', donde 'formula' describe "
+    "cómo se calcula el KPI). No incluyas texto fuera del JSON."
+)
 
 def normalizar_texto(valor):
     """Devuelve un string sin espacios o vacío si el valor es nulo/NaN."""
     if valor is None:
         return ""
     try:
-        if pd.isna(valor):
+        if pd.isna(valor):  
             return ""
     except Exception:
         pass
@@ -29,6 +72,142 @@ def buscar_columna_por_nombre(columnas, nombre_objetivo):
         if col.strip().lower() == objetivo:
             return col
     return None
+
+def reset_database_file():
+    """Elimina la base de datos y archivos auxiliares para reiniciar el flujo."""
+    for suffix in ("", "-wal", "-shm"):
+        path = f"{DB_NAME}{suffix}"
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+def reiniciar_estado_por_upload():
+    """Reinicia la BD y los indicadores de sesión al cargar un nuevo archivo."""
+    reset_database_file()
+    init_database()
+    # Limpiar banderas principales para volver a correr el flujo desde cero
+    for key in [
+        "df_fuente",
+        "archivo_procesado",
+        "niveles_guardados",
+        "asignaciones_niveles",
+        "guardar_niveles_clicked",
+        "jefes_guardados",
+        "asignaciones_jefes",
+        "guardar_jefes_clicked",
+        "indicadores_asignados",
+        "nodo_seleccionado",
+        "filtro_cargo",
+        "selectbox_key_counter",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state.df_fuente = None
+    st.session_state.archivo_procesado = False
+
+def obtener_contexto_cargo_por_nombre(nombre_cargo: str) -> dict:
+    """Extrae datos descriptivos del cargo desde el archivo cargado."""
+    df_fuente = st.session_state.get("df_fuente")
+    if df_fuente is None or not nombre_cargo:
+        return {}
+    columnas = list(df_fuente.columns)
+    col_cargo = buscar_columna_por_nombre(columnas, "Cargo")
+    if not col_cargo:
+        return {}
+    clean_target = normalizar_texto(nombre_cargo).lower()
+    subset = df_fuente[df_fuente[col_cargo].astype(str).str.strip().str.lower() == clean_target]
+    if subset.empty:
+        return {}
+
+    contexto = {}
+    for etiqueta in ["Área", "Departamento", "Responde al Cargo", "Nivel Jerárquico"]:
+        col = buscar_columna_por_nombre(columnas, etiqueta)
+        if col and col in subset:
+            valores = subset[col].dropna().astype(str).str.strip()
+            if not valores.empty:
+                contexto[etiqueta] = valores.iloc[0]
+    return contexto
+
+def _extraer_json_de_respuesta(texto: str):
+    """Intenta extraer un bloque JSON de la respuesta del modelo."""
+    if not texto:
+        return None
+    cleaned = texto.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9]*", "", cleaned)
+        cleaned = cleaned.rsplit("```", 1)[0]
+    match = re.search(r"\{.*\}", cleaned, re.S)
+    if match:
+        cleaned = match.group(0)
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return None
+
+def generar_kpis_con_maria(nombre_cargo, prompt_usuario, kpis_actuales, indicadores_disponibles, max_kpis=3):
+    """Invoca al agente MARIA para sugerir KPIs."""
+    if llm is None or SystemMessage is None or HumanMessage is None:
+        return ("Configura tu OPENAI_API_KEY en st.secrets para habilitar a MARIA.", None)
+
+    contexto_cargo = obtener_contexto_cargo_por_nombre(nombre_cargo)
+    area = contexto_cargo.get("Área", "Área no especificada")
+    depto = contexto_cargo.get("Departamento", "Departamento no especificado")
+    nivel = contexto_cargo.get("Nivel Jerárquico", "Nivel no especificado")
+    jefe = contexto_cargo.get("Responde al Cargo", "No registrado")
+
+    if kpis_actuales:
+        resumen_kpis = "\n".join(
+            f"- {k['nombre']} (peso {k.get('peso') or 's/d'} / indicador: {k.get('indicador') or 'Sin indicador'})"
+            for k in kpis_actuales
+        )
+    else:
+        resumen_kpis = "- El cargo aún no tiene KPIs guardados."
+
+    indicadores_texto = ", ".join(indicadores_disponibles) if indicadores_disponibles else "Sin indicadores definidos"
+
+    user_payload = (
+        f"Cargo: {nombre_cargo}\n"
+        f"Área: {area}\n"
+        f"Departamento: {depto}\n"
+        f"Nivel: {nivel}\n"
+        f"Responde a: {jefe}\n\n"
+        f"KPIs actuales:\n{resumen_kpis}\n\n"
+        f"Indicadores estratégicos disponibles: {indicadores_texto}\n\n"
+        f"Solicitud del usuario: {prompt_usuario}\n\n"
+        f"Genera hasta {max_kpis} KPI(s) nuevos o refinados alineados al contexto, "
+        "con nombre claro, un peso sugerido, la fórmula con la que se calcularía y "
+        "el indicador estratégico al que se conectan. "
+        "Siempre responde en JSON conforme a las instrucciones del sistema."
+    )
+
+    respuesta = llm([SystemMessage(content=MARIA_SYSTEM_PROMPT), HumanMessage(content=user_payload)])
+    contenido = getattr(respuesta, "content", str(respuesta))
+
+    data = _extraer_json_de_respuesta(contenido)
+    mensaje = contenido.strip()
+    tabla = None
+
+    if isinstance(data, dict):
+        mensaje = data.get("mensaje", mensaje)
+        filas = data.get("kpis", [])
+        if isinstance(filas, list) and filas:
+            tabla = pd.DataFrame(filas)
+            if not tabla.empty:
+                tabla = tabla.rename(
+                    columns={
+                        "nombre": "Nombre KPI",
+                        "peso": "Peso sugerido",
+                        "indicador_estrategico": "Indicador estratégico",
+                        "formula": "Fórmula",
+                    }
+                )
+                for columna in ["Nombre KPI", "Fórmula", "Peso sugerido", "Indicador estratégico"]:
+                    if columna not in tabla.columns:
+                        tabla[columna] = ""
+                tabla = tabla[["Nombre KPI", "Fórmula", "Peso sugerido", "Indicador estratégico"]]
+    return mensaje, tabla
 
 def init_database():
     """Inicializa la base de datos SOLO si no existe"""
@@ -338,38 +517,169 @@ def renderizar_organigrama():
         
         st.divider()
         
+        # Cargar KPIs por cargo para mostrarlos como nodos independientes
+        kpis_por_cargo = defaultdict(list)
+        with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT ck.id_cargoKpi,
+                       ck.fk_cargo,
+                       k.nombre_kpi,
+                       ck.peso_kpi,
+                       COALESCE(k.formula_kpi, ''),
+                       COALESCE(ies.nombre_kpiEs, '')
+                FROM CargosKpis ck
+                JOIN Kpis k ON ck.fk_kpi = k.id_kpi
+                LEFT JOIN IndicadoresEstrategicos ies ON k.fk_kpiEs = ies.id_kpiEs
+                ORDER BY ck.fk_cargo, k.nombre_kpi
+                """
+            )
+            for kpi_id, fk_cargo, nombre, peso, formula, indicador in cursor.fetchall():
+                descripcion = normalizar_texto(formula) or normalizar_texto(indicador) or "Sin descripción"
+                try:
+                    peso_val = int(peso) if peso is not None else 0
+                except (TypeError, ValueError):
+                    peso_val = 0
+                kpis_por_cargo[fk_cargo].append(
+                    {
+                        "id": kpi_id,
+                        "nombre": normalizar_texto(nombre),
+                        "peso": peso_val,
+                        "descripcion": descripcion,
+                    }
+                )
+
+        # Calcular posiciones manuales para lograr una distribución uniforme
+        H_SPACING = 280
+        LEVEL_HEIGHT = 220
+        SUMMARY_OFFSET = 110
+
+        posiciones = {}
+        contador_hojas = {"value": 0}
+
+        def obtener_id_nodo(nodo_obj):
+            return nodo_obj.get("id") if nodo_obj.get("id") is not None else nodo_obj["name"]
+
+        def asignar_posiciones(nodo, depth=0):
+            hijos = nodo.get("children", [])
+            if not hijos:
+                contador_hojas["value"] += 1
+                centro = contador_hojas["value"]
+            else:
+                centros_hijos = [asignar_posiciones(hijo, depth + 1) for hijo in hijos]
+                centro = sum(centros_hijos) / len(centros_hijos)
+
+            nodo_key = obtener_id_nodo(nodo)
+            cargo_node_id = f"cargo_{nodo_key}"
+            x_pos = centro * H_SPACING
+            posiciones[cargo_node_id] = (x_pos, depth * LEVEL_HEIGHT)
+
+            summary_id = f"{cargo_node_id}_kpis"
+            posiciones[summary_id] = (x_pos, depth * LEVEL_HEIGHT + SUMMARY_OFFSET)
+
+            return centro
+
+        asignar_posiciones(arbol)
+
+        # Ajustar para centrar el organigrama en pantalla
+        min_x = min(pos[0] for pos in posiciones.values())
+        shift = -(min_x - H_SPACING)
+        for key in list(posiciones.keys()):
+            x, y = posiciones[key]
+            posiciones[key] = (x + shift, y)
+        max_x = max(pos[0] for pos in posiciones.values())
+        canvas_width = int(max_x + H_SPACING)
+
         # Crear nodos y edges desde el árbol filtrado
         nodos = []
         edges = []
-        
-        def agregar_nodos_y_edges(nodo, parent_id=None):
-            """Recursivamente agrega nodos y edges"""
-            nodo_id = str(nodo["id"])
-            nodos.append(Node(id=nodo_id, label=nodo["name"], size=30, title=nodo["name"], shape="box"))
-            
-            if parent_id:
-                edges.append(Edge(source=parent_id, target=nodo_id))
-            
-            for hijo in nodo.get("children", []):
-                agregar_nodos_y_edges(hijo, nodo_id)
-        
+
+        def agregar_nodos_y_edges(nodo):
+            cargo_id_real = obtener_id_nodo(nodo)
+            nodo_id = f"cargo_{cargo_id_real}"
+            x_cargo, y_cargo = posiciones.get(nodo_id, (0, 0))
+            nodos.append(
+                Node(
+                    id=nodo_id,
+                    label=nodo["name"],
+                    size=40,
+                    title=nodo["name"],
+                    shape="box",
+                    color="#d7e3fc",
+                    x=x_cargo,
+                    y=y_cargo,
+                    fixed=True,
+                    physics=False,
+                )
+            )
+
+            kpis_del_cargo = kpis_por_cargo.get(nodo.get("id"), [])
+            summary_id = f"{nodo_id}_kpis"
+            x_summary, y_summary = posiciones.get(summary_id, (x_cargo, y_cargo + SUMMARY_OFFSET))
+            if kpis_del_cargo:
+                resumen_html = "\n".join(
+                    f"- {kpi['nombre']}: {kpi['peso']}%" for kpi in kpis_del_cargo
+                )
+                resumen_title = "\n".join(
+                    f"{kpi['nombre']} · Peso: {kpi['peso']}% · {kpi['descripcion']}"
+                    for kpi in kpis_del_cargo
+                )
+            else:
+                resumen_html = "Sin KPIs registrados"
+                resumen_title = "Aún no hay KPIs asignados a este cargo."
+
+            nodos.append(
+                Node(
+                    id=summary_id,
+                    label=resumen_html,
+                    size=45,
+                    shape="box",
+                    color="#b5e48c",
+                    title=resumen_title,
+                    font={"multi": "html", "size": 14},
+                    x=x_summary,
+                    y=y_summary,
+                    fixed=True,
+                    physics=False,
+                )
+            )
+            edges.append(Edge(source=nodo_id, target=summary_id))
+
+            hijos = nodo.get("children", [])
+            for idx, hijo in enumerate(hijos):
+                child_node_id = f"cargo_{obtener_id_nodo(hijo)}"
+                child_x, _ = posiciones.get(child_node_id, (x_summary, y_summary + LEVEL_HEIGHT))
+                connector_id = f"{summary_id}_connector_{idx}"
+                nodos.append(
+                    Node(
+                        id=connector_id,
+                        label="",
+                        size=5,
+                        shape="dot",
+                        color="rgba(0,0,0,0)",
+                        x=child_x,
+                        y=y_summary,
+                        fixed=True,
+                        physics=False,
+                    )
+                )
+                edges.append(Edge(source=summary_id, target=connector_id))
+                edges.append(Edge(source=connector_id, target=child_node_id))
+                agregar_nodos_y_edges(hijo)
+
         agregar_nodos_y_edges(arbol)
         
         # Configuración del grafo
         config = Config(
-            width=1400,
-            height=300,
+            width=canvas_width,
+            height=650,
             directed=True,
             physics=False,
-            hierarchical=True,
-            layout={"hierarchical": {
-                "direction": "UD", 
-                "sortMethod": "directed",
-                "nodeSpacing": 350,
-                "levelSeparation": 250
-            }},
+            hierarchical=False,
+            edges={"smooth": {"type": "straightCross", "roundness": 0}},
             fit=True,
-            suppress_toolbar=False
+            suppress_toolbar=True,
         )
         
         # Renderizar grafo y capturar click
@@ -380,22 +690,25 @@ def renderizar_organigrama():
         )
         
         # Si se hace clic en un nodo, guardar en session state
-        if selected_node:
+        if selected_node and selected_node.startswith("cargo_"):
             try:
-                cargo_id = int(selected_node)
-                
+                cargo_id = int(selected_node.replace("cargo_", ""))
+
                 with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
                     cursor = conn.cursor()
-                    cursor.execute("""
-                    SELECT nombre_cargo FROM Cargos WHERE id_cargo = ?
-                    """, (cargo_id,))
+                    cursor.execute(
+                        """
+                        SELECT nombre_cargo FROM Cargos WHERE id_cargo = ?
+                        """,
+                        (cargo_id,),
+                    )
                     resultado = cursor.fetchone()
-                    
+
                     if resultado:
                         nombre_cargo = resultado[0]
                         st.session_state.nodo_seleccionado = {
                             "cargo_id": cargo_id,
-                            "nombre_cargo": nombre_cargo
+                            "nombre_cargo": nombre_cargo,
                         }
             except Exception as e:
                 st.error(f"❌ Error al seleccionar nodo: {str(e)}")
@@ -429,6 +742,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
             cursor.execute("""
             SELECT ck.id_cargoKpi,
                    k.nombre_kpi,
+                   k.formula_kpi,
                    ck.peso_kpi,
                    k.id_kpi,
                    ies.nombre_kpiEs,
@@ -440,6 +754,18 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
             ORDER BY k.nombre_kpi
             """, (cargo_id,))
             kpis_cargo = cursor.fetchall()
+            kpis_para_contexto = [
+                {
+                    "id_cargoKpi": id_cargoKpi,
+                    "nombre": nombre_kpi,
+                    "formula": formula_kpi,
+                    "peso": peso_kpi,
+                    "id_kpi": id_kpi,
+                    "indicador": indicador_nombre,
+                    "fk_kpiEs": fk_indicador
+                }
+                for id_cargoKpi, nombre_kpi, formula_kpi, peso_kpi, id_kpi, indicador_nombre, fk_indicador in kpis_cargo
+            ]
             
             # Obtener indicadores estrategicos disponibles
             cursor.execute("""
@@ -456,23 +782,24 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
         # Crear DataFrame editable con opcion de eliminar
         if kpis_cargo:
             datos = []
-            for id_cargoKpi, nombre_kpi, peso_kpi, id_kpi, indicador_nombre, fk_indicador in kpis_cargo:
-                indicador_display = indicador_nombre if indicador_nombre else "-- Sin indicador --"
+            for item in kpis_para_contexto:
+                indicador_display = item["indicador"] if item["indicador"] else "-- Sin indicador --"
                 datos.append({
-                    "KPI": nombre_kpi,
+                    "KPI": item["nombre"],
                     "Alineado a": indicador_display,
-                    "Peso (%)": int(peso_kpi) if peso_kpi else 0,
+                    "Fórmula": normalizar_texto(item.get("formula")),
+                    "Peso (%)": int(item["peso"]) if item["peso"] else 0,
                     "Eliminar": False,
-                    "id_cargoKpi": id_cargoKpi,
-                    "id_kpi": id_kpi,
-                    "fk_kpiEs": fk_indicador
+                    "id_cargoKpi": item["id_cargoKpi"],
+                    "id_kpi": item["id_kpi"],
+                    "fk_kpiEs": item["fk_kpiEs"]
                 })
 
             df_kpis = pd.DataFrame(datos)
 
             st.write("**KPIs Asignados:**")
             df_editado = st.data_editor(
-                df_kpis[["KPI", "Alineado a", "Peso (%)", "Eliminar"]].copy(),
+                df_kpis[["KPI", "Fórmula", "Alineado a", "Peso (%)", "Eliminar"]].copy(),
                 use_container_width=True,
                 key=f"editor_kpis_{cargo_id}",
                 hide_index=True,
@@ -482,12 +809,28 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                         "Alineado a",
                         options=indicadores_opciones,
                         default="-- Sin indicador --"
-                    )
+                    ),
+                    "Fórmula": st.column_config.TextColumn(
+                        "Fórmula",
+                        width="medium",
+                        help="Describe cómo se calcula este KPI."
+                    ),
                 }
             )
+            pesos = pd.to_numeric(df_editado["Peso (%)"], errors="coerce").fillna(0)
+            total_peso = float(pesos.sum())
+            pesos_validos = abs(total_peso - 100.0) < 1e-6
+            st.caption(f"Total de pesos asignados: {total_peso:.0f}% (debe sumar 100%)")
+            if not pesos_validos:
+                st.warning("Ajusta los pesos hasta alcanzar exactamente el 100% para poder guardar.")
 
             # Boton para guardar cambios
-            if st.button("Guardar Cambios", key=f"save_kpis_{cargo_id}", use_container_width=True):
+            if st.button(
+                "Guardar Cambios",
+                key=f"save_kpis_{cargo_id}",
+                use_container_width=True,
+                disabled=not pesos_validos,
+            ):
                 try:
                     cambios = 0
 
@@ -504,6 +847,8 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                             indicador_original_fk = df_kpis.loc[idx, "fk_kpiEs"]
                             indicador_seleccionado = df_editado.loc[idx, "Alineado a"]
                             nuevo_fk = indicadores_dict.get(indicador_seleccionado)
+                            formula_original = normalizar_texto(df_kpis.loc[idx, "Fórmula"])
+                            formula_actualizada = normalizar_texto(df_editado.loc[idx, "Fórmula"])
 
                             if marcar_eliminar:
                                 cursor.execute("""
@@ -527,6 +872,14 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                                 """, (nuevo_fk, int(df_kpis.loc[idx, "id_kpi"])))
                                 cambios += cursor.rowcount
 
+                            if formula_actualizada != formula_original:
+                                cursor.execute("""
+                                UPDATE Kpis
+                                SET formula_kpi = ?
+                                WHERE id_kpi = ?
+                                """, (formula_actualizada or None, int(df_kpis.loc[idx, "id_kpi"])))
+                                cambios += cursor.rowcount
+
                         conn.commit()
 
                     st.success(f"{cambios} cambio(s) guardado(s)")
@@ -540,6 +893,74 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
 
         else:
             st.info("No hay KPIs asignados")
+
+        st.divider()
+        st.markdown("### 🤖 MARIA · Agente IA de KPIs")
+
+        history_key = f"maria_history_{cargo_id}"
+        if history_key not in st.session_state:
+            st.session_state[history_key] = [
+                {
+                    "role": "assistant",
+                    "content": f"Hola, soy MARIA. Dime qué KPIs necesitas para {nombre_cargo} y te sugeriré opciones alineadas a la estrategia.",
+                }
+            ]
+
+        for msg in st.session_state[history_key]:
+            with st.chat_message("assistant" if msg["role"] == "assistant" else "user"):
+                st.markdown(msg["content"])
+                if msg.get("table"):
+                    st.table(pd.DataFrame(msg["table"]))
+
+        if llm is None:
+            st.info("Configura tu `OPENAI_API_KEY` en `st.secrets` e instala `langchain-openai` para habilitar a MARIA.")
+        else:
+            prompt_key = f"maria_prompt_{cargo_id}"
+            clear_flag_key = f"{prompt_key}_clear"
+            if prompt_key not in st.session_state:
+                st.session_state[prompt_key] = ""
+            if st.session_state.get(clear_flag_key):
+                st.session_state[prompt_key] = ""
+                st.session_state[clear_flag_key] = False
+            user_prompt = st.text_area(
+                "Descríbele a MARIA qué necesitas (contexto adicional, metas, dudas, etc.)",
+                key=prompt_key,
+                height=100,
+            )
+            cantidad_key = f"maria_kpi_count_{cargo_id}"
+            num_kpis = st.slider(
+                "Cantidad de KPIs que deseas que MARIA sugiera",
+                min_value=1,
+                max_value=10,
+                value=3,
+                key=cantidad_key,
+                help="MARIA intentará no superar este número, manteniendo coherencia estratégica."
+            )
+            if st.button("Preguntar a MARIA", key=f"maria_ask_{cargo_id}", use_container_width=True):
+                if not user_prompt.strip():
+                    st.warning("Escribe una solicitud para MARIA.")
+                else:
+                    st.session_state[history_key].append({"role": "user", "content": user_prompt})
+                    mensaje, tabla = generar_kpis_con_maria(
+                        nombre_cargo,
+                        user_prompt,
+                        [
+                            {
+                                "nombre": item["nombre"],
+                                "peso": item["peso"],
+                                "indicador": item["indicador"],
+                            }
+                            for item in kpis_para_contexto
+                        ],
+                        [nombre for _, nombre in indicadores_estrategicos],
+                        max_kpis=num_kpis,
+                    )
+                    registro = {"role": "assistant", "content": mensaje}
+                    if tabla is not None and not tabla.empty:
+                        registro["table"] = tabla.to_dict("records")
+                    st.session_state[history_key].append(registro)
+                    st.session_state[clear_flag_key] = True
+                    st.rerun()
         nuevo_nombre = st.text_input(
             "Nombre o Descripcion",
             placeholder="Ej: Tasa de conversion",
@@ -553,6 +974,12 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
             value=0,
             key=f"nuevo_kpi_peso_{cargo_id}"
         )
+        nuevo_formula = st.text_area(
+            "Fórmula (opcional)",
+            placeholder="Ej: (Ventas nuevas / Ventas totales)",
+            key=f"nuevo_kpi_formula_{cargo_id}",
+            height=80,
+        )
         
         opciones_indicadores = ["-- Seleccionar --"] + [nombre for _, nombre in indicadores_estrategicos]
         indicador_seleccionado = st.selectbox(
@@ -563,6 +990,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
         
         if st.button("[+] Crear KPI", key=f"add_kpi_{cargo_id}", use_container_width=True):
             nombre_limpio = nuevo_nombre.strip()
+            formula_limpia = nuevo_formula.strip()
             if not nombre_limpio:
                 st.error("Ingresa un nombre para el KPI")
             elif indicador_seleccionado == "-- Seleccionar --":
@@ -583,9 +1011,9 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                         else:
                             try:
                                 cursor.execute("""
-                                INSERT INTO Kpis (nombre_kpi, fk_kpiEs)
-                                VALUES (?, ?)
-                                """, (nombre_limpio, id_indicador))
+                                INSERT INTO Kpis (nombre_kpi, formula_kpi, fk_kpiEs)
+                                VALUES (?, ?, ?)
+                                """, (nombre_limpio, formula_limpia or None, id_indicador))
                                 id_kpi = cursor.lastrowid
                             except sql.IntegrityError:
                                 cursor.execute("""
@@ -595,6 +1023,12 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                                 if not registro:
                                     raise
                                 id_kpi = registro[0]
+                                if formula_limpia:
+                                    cursor.execute("""
+                                    UPDATE Kpis
+                                    SET formula_kpi = ?
+                                    WHERE id_kpi = ?
+                                    """, (formula_limpia, id_kpi))
                             
                             cursor.execute("""
                             INSERT INTO CargosKpis (fk_cargo, fk_kpi, peso_kpi)
@@ -1239,47 +1673,52 @@ def asignar_jefes_faltantes():
 
 # Ejecutar (con pestañas)
 # Inicializar base de datos (solo si no existe)
-db_es_nueva = init_database()
+init_database()
 
 # Carga de archivo origen (CSV/XLSX)
 st.write("### Carga de archivo origen")
 uploaded_file = st.file_uploader(
-    "Sube tu archivo base (CSV o XLSX)", type=["csv", "xlsx"], accept_multiple_files=False
+    "Sube tu archivo base (CSV o XLSX)",
+    type=["csv", "xlsx"],
+    accept_multiple_files=False,
+    key="archivo_fuente_uploader",
+    on_change=reiniciar_estado_por_upload,
 )
 
 if 'df_fuente' not in st.session_state:
     st.session_state.df_fuente = None
+if 'archivo_procesado' not in st.session_state:
+    st.session_state.archivo_procesado = False
 
 if uploaded_file is not None:
-    try:
-        nombre = uploaded_file.name.lower()
-        if nombre.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
-        else:
-            try:
-                df = pd.read_excel(uploaded_file)
-            except Exception as e:
-                st.error("Error al leer XLSX. Asegurate de tener 'openpyxl' instalado.")
-                raise
-        st.session_state.df_fuente = df
-        msg_block = st.empty()
-        with msg_block.container():
-            insert_data(df)
-            sincronizar_nuevos_kpis(df)
-            st.success("Archivo cargado y datos insertados (si aplicaba)")
-        time.sleep(3)
-        msg_block.empty()
-    except Exception as e:
-        st.error(f"No se pudo procesar el archivo: {e}")
+    if not st.session_state.archivo_procesado:
+        try:
+            reset_database_file()
+            init_database()
+            nombre = uploaded_file.name.lower()
+            if nombre.endswith('.csv'):
+                df = pd.read_csv(uploaded_file)
+            else:
+                try:
+                    df = pd.read_excel(uploaded_file)
+                except Exception as e:
+                    st.error("Error al leer XLSX. Asegurate de tener 'openpyxl' instalado.")
+                    raise
+            st.session_state.df_fuente = df
+            msg_block = st.empty()
+            with msg_block.container():
+                insert_data(df)
+                sincronizar_nuevos_kpis(df)
+                st.success("Archivo cargado y datos insertados (si aplicaba)")
+            time.sleep(3)
+            msg_block.empty()
+            st.session_state.archivo_procesado = True
+        except Exception as e:
+            st.error(f"No se pudo procesar el archivo: {e}")
 else:
     # Si antes habia archivo cargado y ahora no, reiniciar todo
     if st.session_state.df_fuente is not None:
-        import os
-        try:
-            if os.path.exists(DB_NAME):
-                os.remove(DB_NAME)
-        except Exception:
-            pass
+        reset_database_file()
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
@@ -1348,67 +1787,20 @@ with tab_hoja3:
         df_hoja3 = generar_df_hoja3(st.session_state.df_fuente)
         if df_hoja3.empty:
             st.warning("No hay KPIs registrados en la base de datos.")
-        st.dataframe(df_hoja3, use_container_width=True, height=400)
-        st.caption("Este resumen se actualiza automáticamente al modificar los KPIs en el organigrama.")
-
-# Detener ejecución del bloque legacy
-st.stop()
-
-# Ejecutar
-# Inicializar base de datos (solo si no existe)
-db_es_nueva = init_database()
-
-# Cargar datos del Excel
-EXCEL_PATH = Path("./data/tst.xlsx")
-df = pd.read_excel(EXCEL_PATH)
-
-# Insertar datos (solo si la BD está vacía)
-insert_data(df)
-
-# PASO 1: Asignar niveles jerárquicos
-if not st.session_state.get('niveles_guardados', False):
-    st.write("## 🎯 Paso 1: Asignación de Niveles Jerárquicos")
-    resultado = asignar_niveles_jerarquicos()
-    if not resultado:  # Si retorna False, detener
-        st.stop()
-
-# PASO 2: Asignar jefes
-if not st.session_state.get('jefes_guardados', False):
-    st.write("---")
-    st.write("## 👥 Paso 2: Asignación de Jefes")
-    resultado = asignar_jefes_faltantes()
-    if not resultado:  # Si retorna False, detener
-        st.stop()
-
-# PASO 3: Asignar indicadores estratégicos al CEO
-if not st.session_state.get('indicadores_asignados', False):
-    st.write("---")
-    st.write("## 📈 Paso 3: Asignación de Indicadores Estratégicos al CEO")
-    
-    with st.spinner("Asignando indicadores estratégicos..."):
-        asignados = asignar_indicadores_estrategicos_a_ceo()
-        if asignados:
-            st.success("✅ Indicadores estratégicos asignados al CEO")
-            st.session_state.indicadores_asignados = True
-            time.sleep(2)
-            st.rerun()
         else:
-            st.info("ℹ️ Los indicadores estratégicos ya estaban asignados")
-            st.session_state.indicadores_asignados = True
+            st.dataframe(df_hoja3, use_container_width=True, height=400)
+            st.caption("Este resumen se actualiza automáticamente al modificar los KPIs en el organigrama.")
 
-# Mostrar organigrama interactivo
-st.write("---")
-st.write("## 🏢 Organigrama Interactivo")
-st.info("💡 Haz clic en un nodo para ver y editar sus KPIs")
-renderizar_organigrama()
+            # Build Excel payload so the download button serves an .xlsx file
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                df_hoja3.to_excel(writer, index=False, sheet_name="KPIs")
+            output.seek(0)
+            st.download_button(
+                "Descargar archivo actualizado (.xlsx)",
+                data=output.getvalue(),
+                file_name="archivo_actualizado.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
 
-# Botón para reiniciar todo (opcional)
-st.write("---")
-if st.button("🔄 Reiniciar Base de Datos", type="secondary"):
-    import os
-    if os.path.exists(DB_NAME):
-        os.remove(DB_NAME)
-    # Limpiar session_state
-    for key in list(st.session_state.keys()):
-        del st.session_state[key]
-    st.rerun()

@@ -780,7 +780,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
         indicadores_dict.update({nombre: id_kpiEs for id_kpiEs, nombre in indicadores_estrategicos})
 
         # Crear DataFrame editable con opcion de eliminar
-        if kpis_cargo:
+        if kpis_para_contexto:
             datos = []
             for item in kpis_para_contexto:
                 indicador_display = item["indicador"] if item["indicador"] else "-- Sin indicador --"
@@ -792,18 +792,28 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                     "Eliminar": False,
                     "id_cargoKpi": item["id_cargoKpi"],
                     "id_kpi": item["id_kpi"],
-                    "fk_kpiEs": item["fk_kpiEs"]
+                    "fk_kpiEs": item["fk_kpiEs"],
+                    "es_total": False,
                 })
 
             df_kpis = pd.DataFrame(datos)
 
-            st.write("**KPIs Asignados:**")
+            st.markdown("**KPIs Asignados:**")
+            st.caption(f"KPIs cargados: {len(df_kpis)}")
+
             df_editado = st.data_editor(
-                df_kpis[["KPI", "Fórmula", "Alineado a", "Peso (%)", "Eliminar"]].copy(),
+                df_kpis,
                 use_container_width=True,
+                height=min(400, 35 * (len(df_kpis) + 1)),
                 key=f"editor_kpis_{cargo_id}",
                 hide_index=True,
-                num_rows="fixed",
+                column_order=[
+                    "KPI",
+                    "Fórmula",
+                    "Alineado a",
+                    "Peso (%)",
+                    "Eliminar",
+                ],
                 column_config={
                     "Alineado a": st.column_config.SelectboxColumn(
                         "Alineado a",
@@ -815,11 +825,35 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                         width="medium",
                         help="Describe cómo se calcula este KPI."
                     ),
-                }
+                    # Ocultar columnas de control que no deben ser visibles
+                    "id_cargoKpi": None,
+                    "id_kpi": None,
+                    "fk_kpiEs": None,
+                    "es_total": None,
+                },
             )
+
+            # Crear y mostrar la fila de total por separado (no editable)
             pesos = pd.to_numeric(df_editado["Peso (%)"], errors="coerce").fillna(0)
             total_peso = float(pesos.sum())
+            
+            # Usar st.columns para crear una fila de total sin encabezados
+            # Esto es más robusto que usar CSS.
+            st.markdown(
+                """<hr style="margin-top: -0.5rem; margin-bottom: 0.5rem;">""",
+                unsafe_allow_html=True,
+            )
+            total_cols = st.columns([0.28, 0.23, 0.23, 0.16, 0.1])
+            with total_cols[0]:
+                st.markdown("**Total de los Pesos**")
+            with total_cols[3]:
+                st.markdown(f"**{total_peso:.0f}%**")
+            
+
+            # La validación y el botón de guardar ahora usan el df_editado directamente
+            df_editable = df_editado
             pesos_validos = abs(total_peso - 100.0) < 1e-6
+
             st.caption(f"Total de pesos asignados: {total_peso:.0f}% (debe sumar 100%)")
             if not pesos_validos:
                 st.warning("Ajusta los pesos hasta alcanzar exactamente el 100% para poder guardar.")
@@ -838,17 +872,25 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                         conn.execute("PRAGMA foreign_keys = ON")
                         cursor = conn.cursor()
 
+                        base_por_id = {
+                            int(row["id_cargoKpi"]): row
+                            for _, row in df_kpis.iterrows()
+                            if row["id_cargoKpi"] is not None
+                        }
+
                         # Recorrer cada fila del DataFrame editado
-                        for idx in range(len(df_editado)):
-                            id_cargoKpi = int(df_kpis.loc[idx, "id_cargoKpi"])
-                            nuevo_peso = int(df_editado.loc[idx, "Peso (%)"])
-                            marcar_eliminar = bool(df_editado.loc[idx, "Eliminar"])
-                            peso_original = int(df_kpis.loc[idx, "Peso (%)"])
-                            indicador_original_fk = df_kpis.loc[idx, "fk_kpiEs"]
-                            indicador_seleccionado = df_editado.loc[idx, "Alineado a"]
+                        for _, row in df_editable.iterrows():
+                            id_cargoKpi = int(row["id_cargoKpi"])
+                            nuevo_peso = int(row["Peso (%)"])
+                            marcar_eliminar = bool(row["Eliminar"])
+                            indicador_seleccionado = row["Alineado a"]
                             nuevo_fk = indicadores_dict.get(indicador_seleccionado)
-                            formula_original = normalizar_texto(df_kpis.loc[idx, "Fórmula"])
-                            formula_actualizada = normalizar_texto(df_editado.loc[idx, "Fórmula"])
+                            formula_actualizada = normalizar_texto(row["Fórmula"])
+
+                            base_row = base_por_id.get(id_cargoKpi, {})
+                            peso_original = int(base_row.get("Peso (%)", 0))
+                            indicador_original_fk = base_row.get("fk_kpiEs")
+                            formula_original = normalizar_texto(base_row.get("Fórmula"))
 
                             if marcar_eliminar:
                                 cursor.execute("""
@@ -869,7 +911,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                                 UPDATE Kpis
                                 SET fk_kpiEs = ?
                                 WHERE id_kpi = ?
-                                """, (nuevo_fk, int(df_kpis.loc[idx, "id_kpi"])))
+                                """, (nuevo_fk, int(base_row.get("id_kpi"))))
                                 cambios += cursor.rowcount
 
                             if formula_actualizada != formula_original:
@@ -877,7 +919,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                                 UPDATE Kpis
                                 SET formula_kpi = ?
                                 WHERE id_kpi = ?
-                                """, (formula_actualizada or None, int(df_kpis.loc[idx, "id_kpi"])))
+                                """, (formula_actualizada or None, int(base_row.get("id_kpi"))))
                                 cambios += cursor.rowcount
 
                         conn.commit()
@@ -892,7 +934,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                     st.code(traceback.format_exc())
 
         else:
-            st.info("No hay KPIs asignados")
+            st.info("Este cargo aún no tiene KPIs asignados. Puedes crearlos a continuación.")
 
         st.divider()
         st.markdown("### 🤖 MARIA · Agente IA de KPIs")
@@ -1803,4 +1845,3 @@ with tab_hoja3:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
             )
-

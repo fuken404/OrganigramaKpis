@@ -7,6 +7,9 @@ import time
 from contextlib import closing
 import json
 from io import BytesIO
+from collections import defaultdict
+
+st.set_page_config(page_title="Calibración de KPIs", layout="wide")
 
 try:
     from langchain_openai import ChatOpenAI
@@ -15,7 +18,19 @@ except Exception:
     ChatOpenAI = None
     SystemMessage = HumanMessage = None
 
-st.title("🗂️ Gestión de Organigrama y KPIs")
+st.title("⚙️ Calibración de KPIs")
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-left: 1.5rem !important;
+        padding-right: 1.5rem !important;
+        max-width: 100% !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # Crear DB
 DB_NAME = "organigrama_kpis.db"
@@ -43,7 +58,7 @@ def normalizar_texto(valor):
     if valor is None:
         return ""
     try:
-        if pd.isna(valor):
+        if pd.isna(valor):  
             return ""
     except Exception:
         pass
@@ -66,6 +81,30 @@ def reset_database_file():
                 os.remove(path)
             except OSError:
                 pass
+
+def reiniciar_estado_por_upload():
+    """Reinicia la BD y los indicadores de sesión al cargar un nuevo archivo."""
+    reset_database_file()
+    init_database()
+    # Limpiar banderas principales para volver a correr el flujo desde cero
+    for key in [
+        "df_fuente",
+        "archivo_procesado",
+        "niveles_guardados",
+        "asignaciones_niveles",
+        "guardar_niveles_clicked",
+        "jefes_guardados",
+        "asignaciones_jefes",
+        "guardar_jefes_clicked",
+        "indicadores_asignados",
+        "nodo_seleccionado",
+        "filtro_cargo",
+        "selectbox_key_counter",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state.df_fuente = None
+    st.session_state.archivo_procesado = False
 
 def obtener_contexto_cargo_por_nombre(nombre_cargo: str) -> dict:
     """Extrae datos descriptivos del cargo desde el archivo cargado."""
@@ -475,38 +514,169 @@ def renderizar_organigrama():
         
         st.divider()
         
+        # Cargar KPIs por cargo para mostrarlos como nodos independientes
+        kpis_por_cargo = defaultdict(list)
+        with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT ck.id_cargoKpi,
+                       ck.fk_cargo,
+                       k.nombre_kpi,
+                       ck.peso_kpi,
+                       COALESCE(k.formula_kpi, ''),
+                       COALESCE(ies.nombre_kpiEs, '')
+                FROM CargosKpis ck
+                JOIN Kpis k ON ck.fk_kpi = k.id_kpi
+                LEFT JOIN IndicadoresEstrategicos ies ON k.fk_kpiEs = ies.id_kpiEs
+                ORDER BY ck.fk_cargo, k.nombre_kpi
+                """
+            )
+            for kpi_id, fk_cargo, nombre, peso, formula, indicador in cursor.fetchall():
+                descripcion = normalizar_texto(formula) or normalizar_texto(indicador) or "Sin descripción"
+                try:
+                    peso_val = int(peso) if peso is not None else 0
+                except (TypeError, ValueError):
+                    peso_val = 0
+                kpis_por_cargo[fk_cargo].append(
+                    {
+                        "id": kpi_id,
+                        "nombre": normalizar_texto(nombre),
+                        "peso": peso_val,
+                        "descripcion": descripcion,
+                    }
+                )
+
+        # Calcular posiciones manuales para lograr una distribución uniforme
+        H_SPACING = 280
+        LEVEL_HEIGHT = 220
+        SUMMARY_OFFSET = 110
+
+        posiciones = {}
+        contador_hojas = {"value": 0}
+
+        def obtener_id_nodo(nodo_obj):
+            return nodo_obj.get("id") if nodo_obj.get("id") is not None else nodo_obj["name"]
+
+        def asignar_posiciones(nodo, depth=0):
+            hijos = nodo.get("children", [])
+            if not hijos:
+                contador_hojas["value"] += 1
+                centro = contador_hojas["value"]
+            else:
+                centros_hijos = [asignar_posiciones(hijo, depth + 1) for hijo in hijos]
+                centro = sum(centros_hijos) / len(centros_hijos)
+
+            nodo_key = obtener_id_nodo(nodo)
+            cargo_node_id = f"cargo_{nodo_key}"
+            x_pos = centro * H_SPACING
+            posiciones[cargo_node_id] = (x_pos, depth * LEVEL_HEIGHT)
+
+            summary_id = f"{cargo_node_id}_kpis"
+            posiciones[summary_id] = (x_pos, depth * LEVEL_HEIGHT + SUMMARY_OFFSET)
+
+            return centro
+
+        asignar_posiciones(arbol)
+
+        # Ajustar para centrar el organigrama en pantalla
+        min_x = min(pos[0] for pos in posiciones.values())
+        shift = -(min_x - H_SPACING)
+        for key in list(posiciones.keys()):
+            x, y = posiciones[key]
+            posiciones[key] = (x + shift, y)
+        max_x = max(pos[0] for pos in posiciones.values())
+        canvas_width = int(max_x + H_SPACING)
+
         # Crear nodos y edges desde el árbol filtrado
         nodos = []
         edges = []
-        
-        def agregar_nodos_y_edges(nodo, parent_id=None):
-            """Recursivamente agrega nodos y edges"""
-            nodo_id = str(nodo["id"])
-            nodos.append(Node(id=nodo_id, label=nodo["name"], size=30, title=nodo["name"], shape="box"))
-            
-            if parent_id:
-                edges.append(Edge(source=parent_id, target=nodo_id))
-            
-            for hijo in nodo.get("children", []):
-                agregar_nodos_y_edges(hijo, nodo_id)
-        
+
+        def agregar_nodos_y_edges(nodo):
+            cargo_id_real = obtener_id_nodo(nodo)
+            nodo_id = f"cargo_{cargo_id_real}"
+            x_cargo, y_cargo = posiciones.get(nodo_id, (0, 0))
+            nodos.append(
+                Node(
+                    id=nodo_id,
+                    label=nodo["name"],
+                    size=40,
+                    title=nodo["name"],
+                    shape="box",
+                    color="#d7e3fc",
+                    x=x_cargo,
+                    y=y_cargo,
+                    fixed=True,
+                    physics=False,
+                )
+            )
+
+            kpis_del_cargo = kpis_por_cargo.get(nodo.get("id"), [])
+            summary_id = f"{nodo_id}_kpis"
+            x_summary, y_summary = posiciones.get(summary_id, (x_cargo, y_cargo + SUMMARY_OFFSET))
+            if kpis_del_cargo:
+                resumen_html = "\n".join(
+                    f"- {kpi['nombre']}: {kpi['peso']}%" for kpi in kpis_del_cargo
+                )
+                resumen_title = "\n".join(
+                    f"{kpi['nombre']} · Peso: {kpi['peso']}% · {kpi['descripcion']}"
+                    for kpi in kpis_del_cargo
+                )
+            else:
+                resumen_html = "Sin KPIs registrados"
+                resumen_title = "Aún no hay KPIs asignados a este cargo."
+
+            nodos.append(
+                Node(
+                    id=summary_id,
+                    label=resumen_html,
+                    size=45,
+                    shape="box",
+                    color="#b5e48c",
+                    title=resumen_title,
+                    font={"multi": "html", "size": 14},
+                    x=x_summary,
+                    y=y_summary,
+                    fixed=True,
+                    physics=False,
+                )
+            )
+            edges.append(Edge(source=nodo_id, target=summary_id))
+
+            hijos = nodo.get("children", [])
+            for idx, hijo in enumerate(hijos):
+                child_node_id = f"cargo_{obtener_id_nodo(hijo)}"
+                child_x, _ = posiciones.get(child_node_id, (x_summary, y_summary + LEVEL_HEIGHT))
+                connector_id = f"{summary_id}_connector_{idx}"
+                nodos.append(
+                    Node(
+                        id=connector_id,
+                        label="",
+                        size=5,
+                        shape="dot",
+                        color="rgba(0,0,0,0)",
+                        x=child_x,
+                        y=y_summary,
+                        fixed=True,
+                        physics=False,
+                    )
+                )
+                edges.append(Edge(source=summary_id, target=connector_id))
+                edges.append(Edge(source=connector_id, target=child_node_id))
+                agregar_nodos_y_edges(hijo)
+
         agregar_nodos_y_edges(arbol)
         
         # Configuración del grafo
         config = Config(
-            width=1400,
-            height=300,
+            width=canvas_width,
+            height=650,
             directed=True,
             physics=False,
-            hierarchical=True,
-            layout={"hierarchical": {
-                "direction": "UD", 
-                "sortMethod": "directed",
-                "nodeSpacing": 350,
-                "levelSeparation": 250
-            }},
+            hierarchical=False,
+            edges={"smooth": {"type": "straightCross", "roundness": 0}},
             fit=True,
-            suppress_toolbar=False
+            suppress_toolbar=True,
         )
         
         # Renderizar grafo y capturar click
@@ -517,22 +687,25 @@ def renderizar_organigrama():
         )
         
         # Si se hace clic en un nodo, guardar en session state
-        if selected_node:
+        if selected_node and selected_node.startswith("cargo_"):
             try:
-                cargo_id = int(selected_node)
-                
+                cargo_id = int(selected_node.replace("cargo_", ""))
+
                 with closing(sql.connect(DB_NAME, timeout=30.0)) as conn:
                     cursor = conn.cursor()
-                    cursor.execute("""
-                    SELECT nombre_cargo FROM Cargos WHERE id_cargo = ?
-                    """, (cargo_id,))
+                    cursor.execute(
+                        """
+                        SELECT nombre_cargo FROM Cargos WHERE id_cargo = ?
+                        """,
+                        (cargo_id,),
+                    )
                     resultado = cursor.fetchone()
-                    
+
                     if resultado:
                         nombre_cargo = resultado[0]
                         st.session_state.nodo_seleccionado = {
                             "cargo_id": cargo_id,
-                            "nombre_cargo": nombre_cargo
+                            "nombre_cargo": nombre_cargo,
                         }
             except Exception as e:
                 st.error(f"❌ Error al seleccionar nodo: {str(e)}")
@@ -633,9 +806,20 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                     )
                 }
             )
+            pesos = pd.to_numeric(df_editado["Peso (%)"], errors="coerce").fillna(0)
+            total_peso = float(pesos.sum())
+            pesos_validos = abs(total_peso - 100.0) < 1e-6
+            st.caption(f"Total de pesos asignados: {total_peso:.0f}% (debe sumar 100%)")
+            if not pesos_validos:
+                st.warning("Ajusta los pesos hasta alcanzar exactamente el 100% para poder guardar.")
 
             # Boton para guardar cambios
-            if st.button("Guardar Cambios", key=f"save_kpis_{cargo_id}", use_container_width=True):
+            if st.button(
+                "Guardar Cambios",
+                key=f"save_kpis_{cargo_id}",
+                use_container_width=True,
+                disabled=not pesos_validos,
+            ):
                 try:
                     cambios = 0
 
@@ -1460,23 +1644,19 @@ init_database()
 # Carga de archivo origen (CSV/XLSX)
 st.write("### Carga de archivo origen")
 uploaded_file = st.file_uploader(
-    "Sube tu archivo base (CSV o XLSX)", type=["csv", "xlsx"], accept_multiple_files=False
+    "Sube tu archivo base (CSV o XLSX)",
+    type=["csv", "xlsx"],
+    accept_multiple_files=False,
+    key="archivo_fuente_uploader",
+    on_change=reiniciar_estado_por_upload,
 )
 
 if 'df_fuente' not in st.session_state:
     st.session_state.df_fuente = None
 if 'archivo_procesado' not in st.session_state:
     st.session_state.archivo_procesado = False
-if 'last_upload_signature' not in st.session_state:
-    st.session_state.last_upload_signature = None
 
 if uploaded_file is not None:
-    signature = f"{uploaded_file.name}-{getattr(uploaded_file, 'size', 0)}"
-    if st.session_state.last_upload_signature != signature:
-        st.session_state.last_upload_signature = signature
-        st.session_state.archivo_procesado = False
-        st.session_state.df_fuente = None
-
     if not st.session_state.archivo_procesado:
         try:
             reset_database_file()

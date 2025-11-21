@@ -10,25 +10,19 @@ Aplicación Streamlit para construir organigramas interactivos y administrar KPI
 - **Exportación y sincronización**: generación de dataframes consolidados para volver a Excel, así como sincronización incremental de indicadores nuevos desde los archivos cargados.
 
 ## Requisitos previos
-- Python **3.11** (la app se declara en `pyproject.toml` como `>=3.11,<3.12`).
-- [uv](https://github.com/astral-sh/uv) para gestionar dependencias mediante `pyproject.toml`/`uv.lock`.
+- Python **3.11**.
 - Una clave de OpenAI válida si deseas habilitar a MARIA: añádela a `.streamlit/secrets.toml` como `OPENAI_API_KEY = "tu_clave"`.
 - Archivo de entrada con las columnas mínimas (`Cargo`, `Responde al Cargo`, `Nivel Jerárquico`, `Indicador`, `Fórmula`, `Alineado (archivo)`, etc.). Puedes usar `data/tst.xlsx` como referencia.
 
-## Instalación con uv
+## Instalación con pip
 ```bash
-git clone <url-del-repo>
-cd Organigrama\ KPIs
-uv sync        # crea .venv/ y resuelve pyproject.toml + uv.lock
-```
-
-uv crea el entorno virtual automáticamente (por defecto en `.venv`). Para activarlo manualmente en Windows:
-```bash
-.venv\Scripts\activate
-```
-En macOS/Linux:
-```bash
-source .venv/bin/activate
+git clone <url-del-repo> #Clonar repositorio
+cd Organigrama\ KPIs #Ingresar a la carpeta
+py -3.11 -m venv venv #Crear entorno virtual con versión 3.11 de python (necesaria para correcta ejecución)
+venv\Scripts\activate #Activar venv en Windows
+source venv\Scripts\activate #Activar venv en Linux/macOS
+python.exe -m pip install --upgrade pip #Actualizar pip (opcional)
+pip install -r requirements.txt #Instalar dependecias necesarias
 ```
 
 ## Ejecución
@@ -43,11 +37,6 @@ source .venv/bin/activate
    - Selecciona un cargo y usa el panel lateral para editar pesos, alinear indicadores o crear nuevos KPIs.
    - Si configuraste `OPENAI_API_KEY`, chatea con MARIA y convierte sus propuestas en KPIs con un clic.
 
-Para una verificación rápida del entorno puedes ejecutar:
-```bash
-python main.py
-```
-
 ## Estructura relevante
 - `app.py`: lógica completa de Streamlit, conexión SQLite, renderizado del organigrama, panel de KPIs y agente MARIA.
 - `data/`, `docs_iniciales/`: archivos de ejemplo que sirven como base para pruebas o referencias.
@@ -55,13 +44,8 @@ python main.py
 - `.streamlit/secrets.toml`: credenciales y configuración sensible.
 - `others/`: prototipos y pruebas (p.ej. `pruebasGUI.py` para experimentar con grafos).
 
-## Despliegue y empaquetado
-- **Streamlit Cloud u otros PaaS**: configura el build step para que ejecute `uv sync` antes de `streamlit run app.py`. No olvides definir los `secrets`.
-- **Contenedores**: copia `pyproject.toml`, `uv.lock` y ejecuta `uv sync` en la imagen base (por ejemplo, `python:3.11`). Lanza la app con `streamlit run app.py --server.port $PORT`.
-- **Binarios locales**: el proyecto incluye `pyinstaller` en dependencias; puedes generar un ejecutable ejecutando `pyinstaller app.py --onefile` y distribuyendo la carpeta `docs_iniciales`/`data` según necesites.
-
 ## Resolución de problemas
-- **Faltan dependencias**: vuelve a ejecutar `uv sync` (lo puedes forzar con `uv sync --reinstall`).
+- **Faltan dependencias**: vuelve a ejecutar `pip install -r requirements.txt`.
 - **Errores de base de datos**: usa la opción "reset" de la interfaz (botón que llama a `reset_database_file`) o elimina manualmente `organigrama_kpis.db`, `organigrama_kpis.db-wal` y `organigrama_kpis.db-shm`.
 - **MARIA no responde**: verifica que `langchain-openai` esté instalado y que `OPENAI_API_KEY` sea válido en `.streamlit/secrets.toml`.
 - **Organigrama vacío**: revisa que las columnas `Cargo` y `Responde al Cargo` del archivo fuente estén bien escritas; la app es case-insensitive pero requiere coincidencias exactas en valores.

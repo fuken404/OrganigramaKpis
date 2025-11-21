@@ -9,7 +9,7 @@ import json
 from io import BytesIO
 from collections import defaultdict
 
-st.set_page_config(page_title="Calibración de KPIs", layout="wide")
+st.set_page_config(page_title="Calibración de KPIs", layout="wide", page_icon="⚙️")
 
 try:
     from langchain_openai import ChatOpenAI

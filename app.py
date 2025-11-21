@@ -50,7 +50,8 @@ MARIA_SYSTEM_PROMPT = (
     "y mantén pesos razonables (la suma no debe exceder 100% si se aplican todos). "
     "Siempre responde ÚNICAMENTE con un JSON que contenga dos claves: "
     "'mensaje' (texto breve con tu consejo) y 'kpis' (lista de objetos con "
-    "'nombre', 'peso' y 'indicador_estrategico'). No incluyas texto fuera del JSON."
+    "'nombre', 'peso', 'indicador_estrategico' y 'formula', donde 'formula' describe "
+    "cómo se calcula el KPI). No incluyas texto fuera del JSON."
 )
 
 def normalizar_texto(valor):
@@ -176,7 +177,8 @@ def generar_kpis_con_maria(nombre_cargo, prompt_usuario, kpis_actuales, indicado
         f"Indicadores estratégicos disponibles: {indicadores_texto}\n\n"
         f"Solicitud del usuario: {prompt_usuario}\n\n"
         f"Genera hasta {max_kpis} KPI(s) nuevos o refinados alineados al contexto, "
-        "con nombre claro, un peso sugerido y el indicador estratégico al que se conectan. "
+        "con nombre claro, un peso sugerido, la fórmula con la que se calcularía y "
+        "el indicador estratégico al que se conectan. "
         "Siempre responde en JSON conforme a las instrucciones del sistema."
     )
 
@@ -198,12 +200,13 @@ def generar_kpis_con_maria(nombre_cargo, prompt_usuario, kpis_actuales, indicado
                         "nombre": "Nombre KPI",
                         "peso": "Peso sugerido",
                         "indicador_estrategico": "Indicador estratégico",
+                        "formula": "Fórmula",
                     }
                 )
-                for columna in ["Nombre KPI", "Peso sugerido", "Indicador estratégico"]:
+                for columna in ["Nombre KPI", "Fórmula", "Peso sugerido", "Indicador estratégico"]:
                     if columna not in tabla.columns:
                         tabla[columna] = ""
-                tabla = tabla[["Nombre KPI", "Peso sugerido", "Indicador estratégico"]]
+                tabla = tabla[["Nombre KPI", "Fórmula", "Peso sugerido", "Indicador estratégico"]]
     return mensaje, tabla
 
 def init_database():
@@ -739,6 +742,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
             cursor.execute("""
             SELECT ck.id_cargoKpi,
                    k.nombre_kpi,
+                   k.formula_kpi,
                    ck.peso_kpi,
                    k.id_kpi,
                    ies.nombre_kpiEs,
@@ -754,12 +758,13 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                 {
                     "id_cargoKpi": id_cargoKpi,
                     "nombre": nombre_kpi,
+                    "formula": formula_kpi,
                     "peso": peso_kpi,
                     "id_kpi": id_kpi,
                     "indicador": indicador_nombre,
                     "fk_kpiEs": fk_indicador
                 }
-                for id_cargoKpi, nombre_kpi, peso_kpi, id_kpi, indicador_nombre, fk_indicador in kpis_cargo
+                for id_cargoKpi, nombre_kpi, formula_kpi, peso_kpi, id_kpi, indicador_nombre, fk_indicador in kpis_cargo
             ]
             
             # Obtener indicadores estrategicos disponibles
@@ -782,6 +787,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                 datos.append({
                     "KPI": item["nombre"],
                     "Alineado a": indicador_display,
+                    "Fórmula": normalizar_texto(item.get("formula")),
                     "Peso (%)": int(item["peso"]) if item["peso"] else 0,
                     "Eliminar": False,
                     "id_cargoKpi": item["id_cargoKpi"],
@@ -793,7 +799,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
 
             st.write("**KPIs Asignados:**")
             df_editado = st.data_editor(
-                df_kpis[["KPI", "Alineado a", "Peso (%)", "Eliminar"]].copy(),
+                df_kpis[["KPI", "Fórmula", "Alineado a", "Peso (%)", "Eliminar"]].copy(),
                 use_container_width=True,
                 key=f"editor_kpis_{cargo_id}",
                 hide_index=True,
@@ -803,7 +809,12 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                         "Alineado a",
                         options=indicadores_opciones,
                         default="-- Sin indicador --"
-                    )
+                    ),
+                    "Fórmula": st.column_config.TextColumn(
+                        "Fórmula",
+                        width="medium",
+                        help="Describe cómo se calcula este KPI."
+                    ),
                 }
             )
             pesos = pd.to_numeric(df_editado["Peso (%)"], errors="coerce").fillna(0)
@@ -836,6 +847,8 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                             indicador_original_fk = df_kpis.loc[idx, "fk_kpiEs"]
                             indicador_seleccionado = df_editado.loc[idx, "Alineado a"]
                             nuevo_fk = indicadores_dict.get(indicador_seleccionado)
+                            formula_original = normalizar_texto(df_kpis.loc[idx, "Fórmula"])
+                            formula_actualizada = normalizar_texto(df_editado.loc[idx, "Fórmula"])
 
                             if marcar_eliminar:
                                 cursor.execute("""
@@ -857,6 +870,14 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                                 SET fk_kpiEs = ?
                                 WHERE id_kpi = ?
                                 """, (nuevo_fk, int(df_kpis.loc[idx, "id_kpi"])))
+                                cambios += cursor.rowcount
+
+                            if formula_actualizada != formula_original:
+                                cursor.execute("""
+                                UPDATE Kpis
+                                SET formula_kpi = ?
+                                WHERE id_kpi = ?
+                                """, (formula_actualizada or None, int(df_kpis.loc[idx, "id_kpi"])))
                                 cambios += cursor.rowcount
 
                         conn.commit()
@@ -953,6 +974,12 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
             value=0,
             key=f"nuevo_kpi_peso_{cargo_id}"
         )
+        nuevo_formula = st.text_area(
+            "Fórmula (opcional)",
+            placeholder="Ej: (Ventas nuevas / Ventas totales)",
+            key=f"nuevo_kpi_formula_{cargo_id}",
+            height=80,
+        )
         
         opciones_indicadores = ["-- Seleccionar --"] + [nombre for _, nombre in indicadores_estrategicos]
         indicador_seleccionado = st.selectbox(
@@ -963,6 +990,7 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
         
         if st.button("[+] Crear KPI", key=f"add_kpi_{cargo_id}", use_container_width=True):
             nombre_limpio = nuevo_nombre.strip()
+            formula_limpia = nuevo_formula.strip()
             if not nombre_limpio:
                 st.error("Ingresa un nombre para el KPI")
             elif indicador_seleccionado == "-- Seleccionar --":
@@ -983,9 +1011,9 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                         else:
                             try:
                                 cursor.execute("""
-                                INSERT INTO Kpis (nombre_kpi, fk_kpiEs)
-                                VALUES (?, ?)
-                                """, (nombre_limpio, id_indicador))
+                                INSERT INTO Kpis (nombre_kpi, formula_kpi, fk_kpiEs)
+                                VALUES (?, ?, ?)
+                                """, (nombre_limpio, formula_limpia or None, id_indicador))
                                 id_kpi = cursor.lastrowid
                             except sql.IntegrityError:
                                 cursor.execute("""
@@ -995,6 +1023,12 @@ def mostrar_panel_kpis(cargo_id, nombre_cargo):
                                 if not registro:
                                     raise
                                 id_kpi = registro[0]
+                                if formula_limpia:
+                                    cursor.execute("""
+                                    UPDATE Kpis
+                                    SET formula_kpi = ?
+                                    WHERE id_kpi = ?
+                                    """, (formula_limpia, id_kpi))
                             
                             cursor.execute("""
                             INSERT INTO CargosKpis (fk_cargo, fk_kpi, peso_kpi)
